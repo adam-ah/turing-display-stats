@@ -1,0 +1,431 @@
+//go:build windows
+
+// turing-display-go: Communicate with Turing Smart Screen displays from Go.
+//
+// This tool auto-detects a connected Turing 3.5" display on Windows,
+// sends the protocol HELLO handshake, and reports the device's response.
+package main
+
+import (	"fmt"
+	"log"
+	"strings"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+// ---------------------------------------------------------------------------
+// Device signatures – VID/PID pairs recognised by the Python library.
+// ---------------------------------------------------------------------------
+
+type deviceSig struct {
+	vid, pid uint16
+	name     string
+}
+
+var knownDevices = []deviceSig{
+	{0x1a86, 0x5722, "Turing Smart Screen / UsbPCMonitor (Rev A/B)"},
+	{0x454d, 0x4e41, "Kipye Qiye Smart Display (Rev D)"},
+}
+
+// ---------------------------------------------------------------------------
+// Registry helpers
+// ---------------------------------------------------------------------------
+
+const (
+	hklm = windows.HKEY_LOCAL_MACHINE
+	keyRead    = windows.KEY_READ | windows.KEY_WOW64_64KEY
+)
+
+// openRegKey opens a registry key under HKEY_LOCAL_MACHINE.
+func openRegKey(subPath string) (windows.Key, error) {
+	p, err := windows.UTF16PtrFromString(subPath)
+	if err != nil {
+		return 0, err
+	}
+	var k windows.Key
+	err = windows.RegOpenKeyEx(hklm, p, 0, keyRead, &k)
+	return k, err
+}
+
+// enumSerialPorts reads HKEY_LOCAL_MACHINE\HARDWARE\DEVICEMAP\SERIALCOMM
+// and returns a map of device instance path → COM port name.
+func enumSerialPorts() (map[string]string, error) {
+	k, err := openRegKey("HARDWARE\\DEVICEMAP\\SERIALCOMM")
+	if err != nil {
+		return nil, fmt.Errorf("RegOpenKeyEx SERIALCOMM: %w", err)
+	}
+	defer k.Close()
+
+	result := make(map[string]string) // devicePath → comPort
+	var idx uint32
+	for {
+		var nameBuf [256]uint16
+		var nameLen uint32 = uint32(len(nameBuf)) * 2 // bytes
+		var valType uint32
+		var dataBuf [512]uint16
+		var dataLen uint32 = uint32(len(dataBuf)) * 2
+
+		err := windows.RegEnumValue(k, idx, &nameBuf[0], &nameLen, nil, &valType,
+			(*byte)(unsafe.Pointer(&dataBuf[0])), &dataLen)
+		if err == windows.ERROR_NO_MORE_ITEMS {
+			break
+		}
+		if err != nil {
+			idx++
+			continue
+		}
+
+		// data is the COM port name, e.g. "\\.\COM3"
+		comPort := windows.UTF16ToString(dataBuf[:dataLen/2])
+
+		// Try to find the device instance path by searching USB registry.
+		// We do a simple scan: look for PortName value under Enum\USB\*\Device Parameters.
+		devicePath := findDevicePathForPort(comPort)
+		if devicePath != "" {
+			result[devicePath] = comPort
+		}
+
+		idx++
+	}
+	return result, nil
+}
+
+// findDevicePathForPort walks the USB registry tree to find a device whose
+// PortName matches the given COM port string.
+func findDevicePathForPort(comPort string) string {
+	usbBase := "System\\CurrentControlSet\\Enum\\USB"
+	k, err := openRegKey(usbBase)
+	if err != nil {
+		return ""
+	}
+	defer k.Close()
+
+	var vidIdx uint32
+	for {
+		var vidBuf [64]uint16
+		var vidLen uint32 = uint32(len(vidBuf)) * 2
+		err := windows.RegEnumKeyEx(k, vidIdx, &vidBuf[0], &vidLen, nil, nil, nil, nil)
+		if err == windows.ERROR_NO_MORE_ITEMS {
+			break
+		}
+		if err != nil {
+			vidIdx++
+			continue
+		}
+		vid := windows.UTF16ToString(vidBuf[:vidLen/2])
+
+		vidKey, err := openRegKey(usbBase + "\\" + vid)
+		if err != nil {
+			vidIdx++
+			continue
+		}
+
+		var pidIdx uint32
+		for {
+			var pidBuf [64]uint16
+			var pidLen uint32 = uint32(len(pidBuf)) * 2
+			err := windows.RegEnumKeyEx(vidKey, pidIdx, &pidBuf[0], &pidLen, nil, nil, nil, nil)
+			if err == windows.ERROR_NO_MORE_ITEMS {
+				break
+			}
+			if err != nil {
+				pidIdx++
+				continue
+			}
+			pid := windows.UTF16ToString(pidBuf[:pidLen/2])
+
+			pidKey, err := openRegKey(usbBase + "\\" + vid + "\\" + pid)
+			if err != nil {
+				pidIdx++
+				continue
+			}
+
+			var instIdx uint32
+			for {
+				var instBuf [128]uint16
+				var instLen uint32 = uint32(len(instBuf)) * 2
+				err := windows.RegEnumKeyEx(pidKey, instIdx, &instBuf[0], &instLen, nil, nil, nil, nil)
+				if err == windows.ERROR_NO_MORE_ITEMS {
+					break
+				}
+				if err != nil {
+					instIdx++
+					continue
+				}
+				instance := windows.UTF16ToString(instBuf[:instLen/2])
+
+				// Check Device Parameters subkey for PortName
+				paramPath := usbBase + "\\" + vid + "\\" + pid + "\\" + instance + "\\Device Parameters"
+				paramKey, err := openRegKey(paramPath)
+				if err != nil {
+					instIdx++
+					continue
+				}
+
+				var portBuf [32]uint16
+				var portLen uint32 = uint32(len(portBuf)) * 2
+				// Keep the UTF-16 string alive for the duration of the call
+				portNameUTF16 := windows.StringToUTF16("PortName")
+				err = windows.RegQueryValueEx(paramKey, &portNameUTF16[0],
+					nil, nil, (*byte)(unsafe.Pointer(&portBuf[0])), &portLen)
+				paramKey.Close()
+
+				if err == nil {
+					portName := windows.UTF16ToString(portBuf[:portLen/2])
+					if portName == comPort {
+						devicePath := "USB\\" + vid + "&" + pid + "\\" + instance
+						return devicePath
+					}
+				}
+
+				instIdx++
+			}
+			pidKey.Close()
+			pidIdx++
+		}
+		vidKey.Close()
+		vidIdx++
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// VID/PID extraction from a device instance path.
+// ---------------------------------------------------------------------------
+
+func extractVidPid(devicePath string) (uint16, uint16) {
+	upper := strings.ToUpper(devicePath)
+	var vid, pid uint16
+	if i := strings.Index(upper, "VID_"); i >= 0 && i+6 <= len(upper) {
+		fmt.Sscanf(upper[i+4:i+8], "%X", &vid)
+	}
+	if i := strings.Index(upper, "PID_"); i >= 0 && i+6 <= len(upper) {
+		fmt.Sscanf(upper[i+4:i+8], "%X", &pid)
+	}
+	return vid, pid
+}
+
+// ---------------------------------------------------------------------------
+// Device detection
+// ---------------------------------------------------------------------------
+
+// findTuringDisplay scans the registry for a connected Turing display.
+// Returns the COM port name (e.g. "\\\\.\\COM3"), device description, or an error.
+func findTuringDisplay() (comPort, deviceName string, err error) {
+	ports, err := enumSerialPorts()
+	if err != nil {
+		return "", "", fmt.Errorf("enumerate serial ports: %w", err)
+	}
+	if len(ports) == 0 {
+		return "", "", fmt.Errorf("no COM ports found in registry")
+	}
+
+	for devicePath, com := range ports {
+		vid, pid := extractVidPid(devicePath)
+		for _, dev := range knownDevices {
+			if vid == dev.vid && pid == dev.pid {
+				return com, dev.name, nil
+			}
+		}
+	}
+
+	return "", "", fmt.Errorf("no Turing display found — checked %d COM port(s), "+
+		"looking for VID/PID: %s", len(ports), sigList())
+}
+
+func sigList() string {
+	var parts []string
+	for _, d := range knownDevices {
+		parts = append(parts, fmt.Sprintf("VID_%04X PID_%04X (%s)", d.vid, d.pid, d.name))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// ---------------------------------------------------------------------------
+// Serial port open / close (raw Windows API)
+// ---------------------------------------------------------------------------
+
+// openSerial opens a COM port at 115200 baud, 8N1, no flow control.
+func openSerial(portName string) (windows.Handle, error) {
+	// Format: \\.\COMx
+	p, err := windows.UTF16PtrFromString(portName)
+	if err != nil {
+		return 0, err
+	}
+
+	handle, err := windows.CreateFile(
+		p,
+		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		0, // exclusive access
+		nil,
+		windows.OPEN_EXISTING,
+		0,
+		0,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("CreateFile(%s): %w", portName, err)
+	}
+
+	// Configure DCB: 115200 8N1
+	var dcb windows.DCB
+	if err := windows.GetCommState(handle, &dcb); err != nil {
+		windows.CloseHandle(handle)
+		return 0, fmt.Errorf("GetCommState: %w", err)
+	}
+
+	dcb.BaudRate = 115200
+	dcb.ByteSize = 8
+	dcb.Parity = windows.NOPARITY
+	dcb.StopBits = windows.ONESTOPBIT
+	dcb.fBinary = 1
+	dcb.fParity = 1 // enable parity checking (even though NOPARITY)
+	// Disable all flow control for simplicity
+	dcb.OutxCtsFlow = 0
+	dcb.OutxDsrFlow = 0
+	dcb.DtrControl = windows.DTR_CONTROL_DISABLE
+	dcb.RtsFlag = windows.RTS_CONTROL_DISABLE
+
+	if err := windows.SetCommState(handle, &dcb); err != nil {
+		windows.CloseHandle(handle)
+		return 0, fmt.Errorf("SetCommState: %w", err)
+	}
+
+	// Set buffer sizes (64 KB each)
+	if err := windows.SetupComm(handle, 65536, 65536); err != nil {
+		windows.CloseHandle(handle)
+		return 0, fmt.Errorf("SetupComm: %w", err)
+	}
+
+	// Flush any stale data
+	purgeComm(handle, windows.PURGE_TXCLEAR|windows.PURGE_RXCLEAR)
+
+	return handle, nil
+}
+
+func purgeComm(handle windows.Handle, flags uint32) {
+	windows.PurgeComm(handle, flags)
+}
+
+func closeSerial(handle windows.Handle) {
+	windows.CloseHandle(handle)
+}
+
+// ---------------------------------------------------------------------------
+// Protocol: HELLO handshake (Rev A/B)
+// ---------------------------------------------------------------------------
+
+const helloCmd = 0x45 // Command.HELLO from the Python library
+
+// sendHello sends the 6-byte HELLO command and reads back the device's response.
+func sendHello(handle windows.Handle) ([]byte, error) {
+	helloPacket := []byte{helloCmd, helloCmd, helloCmd, helloCmd, helloCmd, helloCmd}
+
+	_, err := windows.WriteFile(handle, helloPacket, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("write HELLO: %w", err)
+	}
+
+	// Read 6 bytes of response
+	resp := make([]byte, 6)
+	n, err := windows.ReadFile(handle, resp, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	return resp[:n], nil
+}
+
+// interpretHello decodes the HELLO response into a human-readable string.
+func interpretHello(resp []byte) string {
+	if len(resp) == 0 {
+		return "No response received — device may be disconnected or on wrong baud rate"
+	}
+
+	// Check if all bytes are the same value (USB Monitor pattern)
+	allSame := true
+	for i := 1; i < len(resp); i++ {
+		if resp[i] != resp[0] {
+			allSame = false
+			break
+		}
+	}
+	if allSame {
+		switch resp[0] {
+		case 0x01:
+			return "USB Monitor 3.5\" (Rev A sub-revision)"
+		case 0x02:
+			return "USB Monitor 5\" (Rev C)"
+		case 0x03:
+			return "USB Monitor 7\""
+		default:
+			return fmt.Sprintf("USB Monitor variant, byte=0x%02X", resp[0])
+		}
+	}
+
+	// All zeros → standard Turing 3.5" (does not answer HELLO)
+	allZero := true
+	for _, b := range resp {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return "Turing Smart Screen 3.5\" (standard, does not respond to HELLO — this is normal)"
+	}
+
+	// Mixed response — dump raw bytes
+	var parts []string
+	for _, b := range resp {
+		parts = append(parts, fmt.Sprintf("0x%02X", b))
+	}
+	return "Mixed/unknown response: " + strings.Join(parts, " ")
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+func main() {
+	log.SetFlags(0) // no timestamp prefix
+
+	fmt.Println("=== Turing Smart Screen — Go Hello ===")
+	fmt.Println()
+
+	// 1. Find the device
+	fmt.Println("[1/3] Scanning for Turing display...")
+	comPort, devName, err := findTuringDisplay()
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	fmt.Printf("  Found: %s\n", devName)
+	fmt.Printf("  COM port: %s\n", comPort)
+	fmt.Println()
+
+	// 2. Open serial connection
+	fmt.Println("[2/3] Opening serial port at 115200 baud...")
+	handle, err := openSerial(comPort)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+	defer closeSerial(handle)
+	fmt.Println("  Serial port opened successfully.")
+	fmt.Println()
+
+	// 3. Send HELLO and read response
+	fmt.Println("[3/3] Sending HELLO handshake (6 × 0x45)...")
+	resp, err := sendHello(handle)
+	if err != nil {
+		log.Fatalf("Error: %v", err)
+	}
+
+	fmt.Printf("  Response (%d bytes): ", len(resp))
+	for _, b := range resp {
+		fmt.Printf("%02X ", b)
+	}
+	fmt.Println()
+	fmt.Println()
+	fmt.Printf("  → %s\n", interpretHello(resp))
+	fmt.Println()
+	fmt.Println("Done!")
+}
