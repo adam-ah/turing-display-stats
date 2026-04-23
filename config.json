@@ -1,0 +1,15 @@
+{
+  "screen": { "width": 320, "height": 480 },
+  "dot_size": 4,
+  "thresholds": {
+    "green":  0,
+    "yellow": 50,
+    "red":    80
+  },
+  "graphs": {
+    "cpu": {
+      "x": 10, "y": 180,
+      "width": 300, "height": 200
+    }
+  }
+}
