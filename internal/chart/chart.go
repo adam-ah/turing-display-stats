@@ -1,6 +1,6 @@
 // Chart rendering for Turing Smart Screen.
 // Pure logic — no Windows APIs — so it can be unit-tested anywhere.
-package displayapp
+package chart
 
 import (
 	"encoding/json"
@@ -135,7 +135,7 @@ type Chart struct {
 // Config loading
 // ---------------------------------------------------------------------------
 
-func loadConfig(path string) (*ChartConfig, error) {
+func LoadConfig(path string) (*ChartConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -147,11 +147,15 @@ func loadConfig(path string) (*ChartConfig, error) {
 	return &cfg, nil
 }
 
+func loadConfig(path string) (*ChartConfig, error) {
+	return LoadConfig(path)
+}
+
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
 
-func newChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig, cc ColorConfig, bg color.RGBA, refreshSec int, noLines bool) *Chart {
+func NewChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig, cc ColorConfig, bg color.RGBA, refreshSec int, noLines bool) *Chart {
 	_ = refreshSec // cadence is enforced by the sampling cache, not the chart renderer.
 	capacity := cfg.Width / dotSize
 	if capacity <= 0 {
@@ -175,13 +179,29 @@ func newChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig, cc Color
 	}
 }
 
+func newChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig, cc ColorConfig, bg color.RGBA, refreshSec int, noLines bool) *Chart {
+	return NewChart(cfg, dotSize, thresholds, cc, bg, refreshSec, noLines)
+}
+
 // ---------------------------------------------------------------------------
 // Update — append one value, diff, batch into blocks, return dirty regions.
 // value is a percentage 0..100.
 // ---------------------------------------------------------------------------
 
-func (c *Chart) update(value float64, now time.Time) []*DirtyRegion {
+func (c *Chart) Update(value float64, now time.Time) []*DirtyRegion {
 	return c.updateRepeated(value, 1)
+}
+
+func (c *Chart) update(value float64, now time.Time) []*DirtyRegion {
+	return c.Update(value, now)
+}
+
+func (c *Chart) UpdateRepeated(value float64, repeats int) []*DirtyRegion {
+	return c.updateRepeated(value, repeats)
+}
+
+func (c *Chart) Capacity() int {
+	return c.capacity
 }
 
 // updateRepeated appends the same value multiple times before rendering.

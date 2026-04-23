@@ -1,9 +1,11 @@
 //go:build windows
 
-package displayapp
+package win
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -23,10 +25,6 @@ const (
 	NIF_TIP         = 0x00000004
 	WM_APP          = 0x8000
 	WM_USER_TRAY    = WM_APP + 1
-	IDI_APPLICATION = 0x7F00
-	LR_SHARED       = 0x00000001
-	LR_LOADFROMFILE = 0x00000010
-	IMAGE_ICON      = 1
 	WM_RBUTTONUP    = 0x0205
 	WM_LBUTTONUP    = 0x0202
 	WM_RBUTTONDOWN  = 0x0204
@@ -52,7 +50,6 @@ var (
 	shell32                 = syscall.NewLazyDLL("shell32.dll")
 	procGetModuleHandle     = kernel32.NewProc("GetModuleHandleW")
 	procLoadCursor          = user32.NewProc("LoadCursorW")
-	procLoadImage           = user32.NewProc("LoadImageW")
 	procRegisterClassEx     = user32.NewProc("RegisterClassExW")
 	procCreateWindowEx      = user32.NewProc("CreateWindowExW")
 	procDefWindowProc       = user32.NewProc("DefWindowProcW")
@@ -69,6 +66,7 @@ var (
 	procTranslateMessage    = user32.NewProc("TranslateMessage")
 	procDispatchMessage     = user32.NewProc("DispatchMessageW")
 	procGetCursorPos        = user32.NewProc("GetCursorPos")
+	procCreateIconFromResEx = user32.NewProc("CreateIconFromResourceEx")
 )
 
 // WNDCLASSEX matches the Windows WNDCLASSEX structure.
@@ -144,7 +142,7 @@ var trayReady = make(chan struct{})
 // runs the message pump. The window and message pump MUST be in the same
 // goroutine AND locked to the same OS thread (runtime.LockOSThread) because
 // Windows messages are thread-local.
-func initTray() error {
+func InitTray() error {
 	initErr := make(chan error, 1)
 	go func() {
 		// Lock this goroutine to a single OS thread. Windows requires that
@@ -198,20 +196,9 @@ func createTrayWindow() error {
 	}
 	mainWnd = ret
 
-	iconPath, err := repoAssetPath("res", "icons", "monitor-icon-17865", "icon.ico")
+	icon, err := loadTrayIcon()
 	if err != nil {
 		return err
-	}
-	iconPathPtr, err := windows.UTF16PtrFromString(iconPath)
-	if err != nil {
-		return err
-	}
-	icon, _, _ := procLoadImage.Call(
-		0, uintptr(unsafe.Pointer(iconPathPtr)), IMAGE_ICON,
-		0, 0, LR_SHARED|LR_LOADFROMFILE,
-	)
-	if icon == 0 {
-		return fmt.Errorf("LoadImage failed for %s", iconPath)
 	}
 
 	nid := NOTIFYICONDATA{
@@ -238,13 +225,17 @@ func createTrayWindow() error {
 	return nil
 }
 
-func removeTray() {
+func RemoveTray() {
 	nid := NOTIFYICONDATA{
 		CbSize: uint32(unsafe.Sizeof(NOTIFYICONDATA{})),
 		HWnd:   mainWnd,
 		UID:    1,
 	}
 	procShellNotifyIcon.Call(NIM_DELETE, uintptr(unsafe.Pointer(&nid)))
+}
+
+func ExitApp() <-chan struct{} {
+	return exitApp
 }
 
 func trayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
@@ -338,11 +329,19 @@ func showAbout() {
 }
 
 func openConfigFile() {
-	path, _ := windows.UTF16PtrFromString(appConfigPath())
+	path, _ := windows.UTF16PtrFromString(configPathForExecutable())
 	procShellExecute.Call(0, 0, uintptr(unsafe.Pointer(path)), 0, 0, 1)
 }
 
 func utf16ptr(s string) *uint16 {
 	p, _ := windows.UTF16PtrFromString(s)
 	return p
+}
+
+func configPathForExecutable() string {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "config.json"
+	}
+	return filepath.Join(filepath.Dir(exePath), "config.json")
 }

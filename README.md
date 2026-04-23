@@ -1,61 +1,60 @@
 # turing-display-go
 
-Communicate with a **Turing Smart Screen 3.5"** (or compatible) display from Go on Windows.
+Go app for Windows that drives a **Turing Smart Screen 3.5"** or compatible USB display.
 
-## What it does
+## Features
 
-1. **Auto-detects** the display's COM port by scanning the Windows registry for known VID/PID pairs
-2. Opens the serial connection at **115200 baud, 8N1**
-3. Sends the protocol **HELLO handshake** (6 × `0x45`) and reads the device's response
-4. Prints a human-readable interpretation of what the display reports back
-5. Renders live **GPU VRAM**, **GPU 3D load**, **RAM usage**, and **CPU usage** on the display
+- Auto-detects the display COM port from Windows registry data
+- Opens the serial connection at `115200 baud`, `8N1`
+- Sends the device `HELLO` handshake and prints a readable response
+- Renders live CPU, RAM, GPU, and VRAM usage on the display
+- Uses embedded tray and app icons, so no icon file is needed next to the built exe
 
 ## Requirements
 
-- **Windows** 10/11 (uses Windows Registry + CreateFile API)
-- **Go 1.21+** installed
-- The Turing display connected via USB
+- Windows 10 or 11
+- Go 1.21 or newer
+- The display connected by USB
 
-## Build & run
+## Project Layout
+
+- [`cmd/main.go`](cmd/main.go) - Windows entrypoint
+- [`internal/app`](internal/app) - startup and orchestration
+- [`internal/chart`](internal/chart) - chart rendering and config parsing
+- [`internal/frame`](internal/frame) - screen buffer helpers
+- [`internal/sampler`](internal/sampler) - metric cadence helpers
+- [`internal/win`](internal/win) - Windows APIs, tray, serial, and bitmap transfer
+- [`config/config.json`](config/config.json) - sample config copied beside the exe at build time
+
+## Build
 
 ```powershell
-cd go_display
-go mod tidy
-go build -o dist/turing-display.exe ./cmd/turing-display
+go build -o dist/turing-display.exe ./cmd
 Copy-Item config\config.json dist\config.json
+```
+
+To regenerate the tray and app icon resources from the SVG source, run `build/windows/update-icon.sh` from a Bash shell.
+
+## Run
+
+```powershell
 .\dist\turing-display.exe
 ```
 
-## How it works
+## Config
 
-### Device detection
+The app looks for `config.json` next to the executable at runtime.
 
-The tool reads `HKEY_LOCAL_MACHINE\HARDWARE\DEVICEMAP\SERIALCOMM` to enumerate all COM ports, then walks the USB registry tree (`HKLM\System\CurrentControlSet\Enum\USB\`) to match each port against known device signatures:
+The build copies:
 
-| VID    | PID    | Device                        |
-|--------|--------|-------------------------------|
-| 1A86   | 5722   | Turing Smart Screen / UsbPCMonitor (Rev A/B) |
-| 454D   | 4E41   | Kipye Qiye Smart Display (Rev D)    |
+- source: `config/config.json`
+- runtime: `dist/config.json`
 
-### Serial protocol
+## How It Works
 
-The Turing 3.5" uses a simple UART protocol:
-- **Baud rate:** 115200
-- **No flow control** required for basic operations
-- **HELLO command:** Send 6 bytes of `0x45`, read 6 bytes back to identify the device variant
+The app scans known VID/PID pairs, opens the matching COM port, performs the handshake, and then updates the display once per turn using cached samples so slower metrics stay aligned.
 
-### Adding more functionality
+## Notes
 
-To display an image, you would:
-1. Convert your image to **RGB565** (16-bit per pixel)
-2. Send a `DISPLAY_BITMAP` command with coordinates
-3. Stream the raw RGB565 pixel data in chunks
-
-See the Python library's `library/lcd/serialize.py` for the exact RGB565 conversion formula:
-```
-R5 << 11 | G6 << 5 | B5   (little-endian, 2 bytes per pixel)
-```
-
-## License
-
-Same as the parent project: GPL-3.0-or-later
+- The tray icon is embedded in the binary.
+- The project is Windows-only.

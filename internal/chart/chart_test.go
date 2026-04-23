@@ -1,4 +1,4 @@
-package displayapp
+package chart
 
 import (
 	"image"
@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"turing-display-go/internal/sampler"
 )
 
 // ---------------------------------------------------------------------------
@@ -582,63 +584,63 @@ func TestChartUpdateAlwaysAdvances(t *testing.T) {
 }
 
 func TestMetricCacheTurnCadence(t *testing.T) {
-	cache := newMetricCache(2)
+	cache := sampler.NewMetricCache(2)
 
-	if got, repeats := cache.update(0, 10); got != 10 || repeats != 2 {
+	if got, repeats := cache.Update(0, 10); got != 10 || repeats != 2 {
 		t.Fatalf("first update = (%v,%d), want (10,2)", got, repeats)
 	}
-	if got, repeats := cache.update(1, 20); got != 10 || repeats != 0 {
+	if got, repeats := cache.Update(1, 20); got != 10 || repeats != 0 {
 		t.Fatalf("1s update = (%v,%d), want repeated (10,0)", got, repeats)
 	}
-	if got, repeats := cache.update(2, 30); got != 30 || repeats != 2 {
+	if got, repeats := cache.Update(2, 30); got != 30 || repeats != 2 {
 		t.Fatalf("2s update = (%v,%d), want (30,2)", got, repeats)
 	}
-	if got, repeats := cache.update(3, 40); got != 30 || repeats != 0 {
+	if got, repeats := cache.Update(3, 40); got != 30 || repeats != 0 {
 		t.Fatalf("3s update = (%v,%d), want repeated (30,0)", got, repeats)
 	}
 }
 
 func TestMetricCacheDefaultsToOneSecond(t *testing.T) {
-	cache := newMetricCache(0)
-	if cache.refreshSec != 1 {
-		t.Fatalf("refreshSec = %d, want 1", cache.refreshSec)
+	cache := sampler.NewMetricCache(0)
+	if cache.RefreshSec != 1 {
+		t.Fatalf("refreshSec = %d, want 1", cache.RefreshSec)
 	}
 }
 
 func TestSlowMetricSkipsIntermediateTurn(t *testing.T) {
-	cache := newMetricCache(2)
+	cache := sampler.NewMetricCache(2)
 
-	value, repeats := cache.update(0, 42)
+	value, repeats := cache.Update(0, 42)
 	if value != 42 || repeats != 2 {
 		t.Fatalf("initial update = (%v,%d), want (42,2)", value, repeats)
 	}
 
-	value, repeats = cache.update(1, 99)
+	value, repeats = cache.Update(1, 99)
 	if value != 42 || repeats != 0 {
 		t.Fatalf("intermediate tick = (%v,%d), want repeated (42,0)", value, repeats)
 	}
 
-	value, repeats = cache.update(2, 99)
+	value, repeats = cache.Update(2, 99)
 	if value != 99 || repeats != 2 {
 		t.Fatalf("refresh tick = (%v,%d), want (99,2)", value, repeats)
 	}
 }
 
 func TestSlowMetricUsesTurnCountNotWallClock(t *testing.T) {
-	cache := newMetricCache(2)
+	cache := sampler.NewMetricCache(2)
 
-	value, repeats := cache.update(10, 55)
+	value, repeats := cache.Update(10, 55)
 	if value != 55 || repeats != 2 {
 		t.Fatalf("turn 10 = (%v,%d), want (55,2)", value, repeats)
 	}
 
 	// Large wall-clock gaps do not exist in this helper anymore; only turns matter.
-	value, repeats = cache.update(11, 66)
+	value, repeats = cache.Update(11, 66)
 	if value != 55 || repeats != 0 {
 		t.Fatalf("turn 11 = (%v,%d), want repeated (55,0)", value, repeats)
 	}
 
-	value, repeats = cache.update(12, 77)
+	value, repeats = cache.Update(12, 77)
 	if value != 77 || repeats != 2 {
 		t.Fatalf("turn 12 = (%v,%d), want (77,2)", value, repeats)
 	}
@@ -666,7 +668,7 @@ func TestApplyRegions(t *testing.T) {
 		}(),
 	}
 
-	applyRegions(base, []*DirtyRegion{region})
+	ApplyRegions(base, []*DirtyRegion{region})
 	if clr, ok := base.At(1, 1).(color.RGBA); !ok || clr.R != 255 || clr.G != 0 || clr.B != 0 {
 		t.Fatalf("composed pixel = %#v, want red", base.At(1, 1))
 	}

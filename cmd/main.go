@@ -5,10 +5,10 @@ package main
 import (
 	"flag"
 
-	"turing-display-go/internal/displayapp"
+	"turing-display-go/internal/app"
 )
 
 func main() {
 	flag.Parse()
-	displayapp.Run()
+	app.Run()
 }

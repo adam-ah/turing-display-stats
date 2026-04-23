@@ -2,7 +2,7 @@
 
 // turing-display-go: Communicate with Turing Smart Screen displays from Go.
 // Build: go build -ldflags="-H windowsgui" -o turing-display.exe
-package displayapp
+package app
 
 import (
 	"flag"
@@ -20,11 +20,12 @@ import (
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
-)
 
-// ---------------------------------------------------------------------------
-// Debug logger — only writes when --debug is set
-// ---------------------------------------------------------------------------
+	"turing-display-go/internal/chart"
+	"turing-display-go/internal/frame"
+	"turing-display-go/internal/sampler"
+	"turing-display-go/internal/win"
+)
 
 var debugEnabled bool
 
@@ -47,29 +48,19 @@ func (l *debugLogger) Printf(format string, v ...interface{}) {
 
 var dbg debugLogger
 
-// ---------------------------------------------------------------------------
-// Screen constants
-// ---------------------------------------------------------------------------
-
 const (
 	screenWidth  = 320
 	screenHeight = 480
-	divColor     = 0x80 // gray divider color (RGB 128,128,128)
+	divColor     = 0x80
 )
 
-// Layout constants per section (120px each).
 const (
 	sectionHeight   = 120
-	labelZoneHeight = 15 // rows 1..15 after divider (textH=13 + 2px padding)
-	chartOffset     = 16 // chart starts at sectionStart + 16
+	labelZoneHeight = 15
+	chartOffset     = 16
 )
 
-// sectionStart returns the top row of each section.
 var sectionStart = [4]int{0, 120, 240, 360}
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 func shouldStop(interrupt <-chan os.Signal, exit <-chan struct{}) bool {
 	select {
@@ -88,145 +79,133 @@ func Run() {
 
 	dbg.Printf("=== Turing Smart Screen ===")
 
-	// Init tray icon
-	if err := initTray(); err != nil {
+	if err := win.InitTray(); err != nil {
 		dbg.Printf("tray init warning: %v", err)
 	} else {
-		defer removeTray()
+		defer win.RemoveTray()
 	}
 
-	// 1. Find the device
 	dbg.Printf("Scanning for Turing display...")
-	comPort, devName, err := findTuringDisplay()
+	comPort, devName, err := win.FindTuringDisplay()
 	if err != nil {
 		dbg.Printf("Error: %v", err)
 		os.Exit(1)
 	}
 	dbg.Printf("Found: %s on %s", devName, comPort)
 
-	// 2. Open serial connection
 	dbg.Printf("Opening serial port at 115200 baud...")
-	handle, err := openSerial(comPort)
+	handle, err := win.OpenSerial(comPort)
 	if err != nil {
 		dbg.Printf("Error: %v", err)
 		os.Exit(1)
 	}
-	defer closeSerial(handle)
+	defer win.CloseSerial(handle)
 	dbg.Printf("Serial port opened.")
 
-	// 3. Send HELLO handshake
 	dbg.Printf("Sending HELLO handshake...")
-	resp, err := sendHello(handle)
+	resp, err := win.SendHello(handle)
 	if err != nil {
 		dbg.Printf("Error: %v", err)
 		os.Exit(1)
 	}
-	dbg.Printf("Response (%d bytes): %s", len(resp), interpretHello(resp))
+	dbg.Printf("Response (%d bytes): %s", len(resp), win.InterpretHello(resp))
 
-	// 4. Load config
 	configPath := appConfigPath()
-	chartCfg, err := loadConfig(configPath)
+	chartCfg, err := chart.LoadConfig(configPath)
 	if err != nil {
 		dbg.Printf("Warning: no %s: %v", configPath, err)
 		chartCfg = nil
 	}
 
-	// 5. Init GPU/CPU samplers
-	statsQuery, err := newGpuPdhQuery()
+	statsQuery, err := win.NewGpuPdhQuery()
 	if err != nil {
 		dbg.Printf("Error: %v", err)
 		os.Exit(1)
 	}
-	defer statsQuery.close()
+	defer statsQuery.Close()
 
-	cpuSampler, err := newCpuUsageSampler()
-	if err != nil {
-		dbg.Printf("Error: %v", err)
-		os.Exit(1)
-	}
-
-	// 6. Get first stats snapshot (needed for RAM/VRAM labels)
-	stats, err := statsQuery.snapshot()
-	if err != nil {
-		dbg.Printf("Error: %v", err)
-		os.Exit(1)
-	}
-	memory, err := readSystemMemoryStats()
+	cpuSampler, err := win.NewCpuUsageSampler()
 	if err != nil {
 		dbg.Printf("Error: %v", err)
 		os.Exit(1)
 	}
 
-	// 7. Init charts
-	var charts [4]*Chart // cpu, ram, gpu, vram
-	var metricCaches [4]metricCache
+	stats, err := statsQuery.Snapshot()
+	if err != nil {
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
+	}
+	memory, err := win.ReadSystemMemoryStats()
+	if err != nil {
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
+	}
+
+	var charts [4]*chart.Chart
+	var metricCaches [4]sampler.MetricCache
 	for i := range metricCaches {
-		metricCaches[i] = newMetricCache(1)
+		metricCaches[i] = sampler.NewMetricCache(1)
 	}
 	if chartCfg != nil {
 		names := [4]string{"cpu", "ram", "gpu", "vram"}
 		for i, name := range names {
 			if gCfg, ok := chartCfg.Graphs[name]; ok {
-				charts[i] = newChart(gCfg, chartCfg.DotSize, chartCfg.Thresholds, chartCfg.Colors, chartCfg.Colors.Background.RGBA, gCfg.RefreshSec, true)
-				metricCaches[i] = newMetricCache(gCfg.RefreshSec)
+				charts[i] = chart.NewChart(gCfg, chartCfg.DotSize, chartCfg.Thresholds, chartCfg.Colors, chartCfg.Colors.Background.RGBA, gCfg.RefreshSec, true)
+				metricCaches[i] = sampler.NewMetricCache(gCfg.RefreshSec)
 				dbg.Printf("%s chart: %dx%d at (%d,%d), capacity=%d",
-					name, gCfg.Width, gCfg.Height, gCfg.X, gCfg.Y, charts[i].capacity)
+					name, gCfg.Width, gCfg.Height, gCfg.X, gCfg.Y, charts[i].Capacity())
 			}
 		}
 	}
 
-	// 8. Draw base frame (white + dividers + labels)
 	labels := [4]string{
 		"CPU",
-		fmt.Sprintf("RAM - %s", formatBytesGiB(memory.totalBytes)),
+		fmt.Sprintf("RAM - %s", win.FormatBytesGiB(memory.TotalBytes)),
 		"GPU",
-		fmt.Sprintf("VRAM - %s", formatBytesGiB(stats.totalBytes)),
+		fmt.Sprintf("VRAM - %s", win.FormatBytesGiB(stats.TotalBytes)),
 	}
 	fontColor := color.RGBA{0, 0, 0, 255}
 	if chartCfg != nil {
 		fontColor = chartCfg.Colors.FontColor.RGBA
 	}
 	base := renderBaseFrame(labels, fontColor)
-	if err := sendDisplayBitmapRevA(handle, 0, 0, screenWidth-1, screenHeight-1, base); err != nil {
+	if err := win.SendDisplayBitmapRevA(handle, 0, 0, screenWidth-1, screenHeight-1, base); err != nil {
 		dbg.Printf("Error: %v", err)
 		os.Exit(1)
 	}
 	dbg.Printf("Base frame sent.")
-	screenFrame := newScreenFrame(base)
+	screenFrame := frame.NewScreenFrame(base)
 
-	// 9. Signal handling
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
 
-	// 10. Update function
 	updateStats := func(turn int) error {
-		stats, err := statsQuery.snapshot()
+		stats, err := statsQuery.Snapshot()
 		if err != nil {
 			return err
 		}
-		memory, err := readSystemMemoryStats()
+		memory, err := win.ReadSystemMemoryStats()
 		if err != nil {
 			return err
 		}
-		cpuPct, err := cpuSampler.snapshot()
+		cpuPct, err := cpuSampler.Snapshot()
 		if err != nil {
 			return err
 		}
 
-		ramPct := memory.loadPct
-		gpuPct := stats.utilPct
+		ramPct := memory.LoadPct
+		gpuPct := stats.UtilPct
 		var vramPct float64
-		if stats.totalBytes > 0 {
-			vramPct = float64(stats.usedBytes) * 100 / float64(stats.totalBytes)
+		if stats.TotalBytes > 0 {
+			vramPct = float64(stats.UsedBytes) * 100 / float64(stats.TotalBytes)
 		}
 
-		cpuPct, cpuRepeats := metricCaches[0].update(turn, cpuPct)
-		ramPct, ramRepeats := metricCaches[1].update(turn, ramPct)
-		gpuPct, gpuRepeats := metricCaches[2].update(turn, gpuPct)
-		vramPct, vramRepeats := metricCaches[3].update(turn, vramPct)
+		cpuPct, cpuRepeats := metricCaches[0].Update(turn, cpuPct)
+		ramPct, ramRepeats := metricCaches[1].Update(turn, ramPct)
+		gpuPct, gpuRepeats := metricCaches[2].Update(turn, gpuPct)
+		vramPct, vramRepeats := metricCaches[3].Update(turn, vramPct)
 
-		// Update each chart and only send the regions that changed.
 		for i, ch := range charts {
 			if ch == nil {
 				continue
@@ -250,10 +229,10 @@ func Run() {
 			if repeats == 0 {
 				continue
 			}
-			dirtyRegions := ch.updateRepeated(value, repeats)
-			applyRegions(screenFrame, dirtyRegions)
+			dirtyRegions := ch.UpdateRepeated(value, repeats)
+			chart.ApplyRegions(screenFrame, dirtyRegions)
 			for _, r := range dirtyRegions {
-				if err := sendDisplayBitmapRevA(handle, r.X, r.Y,
+				if err := win.SendDisplayBitmapRevA(handle, r.X, r.Y,
 					r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
 					return err
 				}
@@ -265,7 +244,6 @@ func Run() {
 		return nil
 	}
 
-	// Initial update
 	turn := 0
 	if err := updateStats(turn); err != nil {
 		dbg.Printf("Error: %v", err)
@@ -273,9 +251,8 @@ func Run() {
 	}
 	dbg.Printf("Running... (Ctrl+C to stop)")
 
-	// 11. Main loop
 	for {
-		if shouldStop(interrupt, exitApp) {
+		if shouldStop(interrupt, win.ExitApp()) {
 			dbg.Printf("Exit via tray menu.")
 			return
 		}
@@ -289,15 +266,6 @@ func Run() {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Base frame — white canvas with 4 dividers and labels
-//
-// Each section (120px):
-//   row 0:        gray divider line
-//   rows 1..13:   label zone (white bg, centered text)
-//   rows 14..119: chart area (106px)
-// ---------------------------------------------------------------------------
-
 func renderBaseFrame(labels [4]string, fontColor color.RGBA) *image.RGBA {
 	white := color.RGBA{255, 255, 255, 255}
 	gray := color.RGBA{divColor, divColor, divColor, 255}
@@ -310,33 +278,24 @@ func renderBaseFrame(labels [4]string, fontColor color.RGBA) *image.RGBA {
 
 	for i, label := range labels {
 		start := sectionStart[i]
-
-		// Gray divider line at top of section.
 		for x := 0; x < screenWidth; x++ {
 			img.Set(x, start, gray)
 		}
 
-		// Label zone: rows start+1 .. start+labelZoneHeight
 		labelTop := start + 1
-
-		// Measure text.
 		textWidth := font.MeasureString(face, label).Ceil()
 		padding := 4
 		rectW := textWidth + padding
 		rectX := (screenWidth - rectW) / 2
 
-		// Center text vertically in label zone using correct baseline math.
-		// Text occupies: baseline-ascent .. baseline+descent (total = ascent+descent).
-		textH := metrics.Ascent.Ceil() + metrics.Descent.Ceil() // 13
-		textTop := labelTop + (labelZoneHeight-textH)/2         // 1+(15-13)/2 = 2
-		baseline := textTop + metrics.Ascent.Ceil()             // 2+11 = 13
-		textBot := baseline + metrics.Descent.Ceil()            // 13+2 = 15
+		textH := metrics.Ascent.Ceil() + metrics.Descent.Ceil()
+		textTop := labelTop + (labelZoneHeight-textH)/2
+		baseline := textTop + metrics.Ascent.Ceil()
+		textBot := baseline + metrics.Descent.Ceil()
 
-		// White background covering the full text extent.
 		draw.Draw(img, image.Rect(rectX, textTop, rectX+rectW, textBot+1),
 			&image.Uniform{white}, image.Point{}, draw.Src)
 
-		// Draw label text.
 		d := &font.Drawer{
 			Dst:  img,
 			Src:  image.NewUniform(fontColor),

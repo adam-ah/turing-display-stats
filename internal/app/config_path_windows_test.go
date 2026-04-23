@@ -1,6 +1,6 @@
 //go:build windows
 
-package displayapp
+package app
 
 import (
 	"path/filepath"

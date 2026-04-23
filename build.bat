@@ -18,8 +18,14 @@ if errorlevel 1 (
     exit /b 1
 )
 if not exist dist mkdir dist
+echo Building Windows resources...
+go run github.com/tc-hib/go-winres@latest make --in build\windows\winres.json --out cmd\rsrc
+if errorlevel 1 (
+    echo Resource build failed!
+    exit /b 1
+)
 echo Building turing-display.exe...
-go build -ldflags="-H windowsgui" -o dist\turing-display.exe ./cmd/turing-display
+go build -ldflags="-H windowsgui" -o dist\turing-display.exe ./cmd
 if errorlevel 1 (
     echo Build failed!
     exit /b 1

@@ -1,7 +1,7 @@
 //go:build windows
 
 // Windows API wrappers: serial port, GPU PDH, DXGI, system memory, CPU usage.
-package displayapp
+package win
 
 import (
 	"encoding/binary"
@@ -135,7 +135,7 @@ func parseVidPid(v interface{}) (uint16, uint16) {
 	return vid, pid
 }
 
-func findTuringDisplay() (comPort, deviceName string, err error) {
+func FindTuringDisplay() (comPort, deviceName string, err error) {
 	ports, err := enumSerialPorts()
 	if err != nil {
 		return "", "", fmt.Errorf("enumerate serial ports: %w", err)
@@ -168,7 +168,7 @@ func sigList() string {
 // Serial port
 // ---------------------------------------------------------------------------
 
-func openSerial(portName string) (windows.Handle, error) {
+func OpenSerial(portName string) (windows.Handle, error) {
 	p, err := windows.UTF16PtrFromString(portName)
 	if err != nil {
 		return 0, err
@@ -230,7 +230,7 @@ func openSerial(portName string) (windows.Handle, error) {
 	return handle, nil
 }
 
-func closeSerial(handle windows.Handle) {
+func CloseSerial(handle windows.Handle) {
 	windows.CloseHandle(handle)
 }
 
@@ -240,7 +240,7 @@ func closeSerial(handle windows.Handle) {
 
 const helloCmd = 0x45
 
-func sendHello(handle windows.Handle) ([]byte, error) {
+func SendHello(handle windows.Handle) ([]byte, error) {
 	helloPacket := []byte{helloCmd, helloCmd, helloCmd, helloCmd, helloCmd, helloCmd}
 
 	var written uint32
@@ -283,7 +283,7 @@ func imageToRGB565LE(img image.Image) []byte {
 	return out
 }
 
-func sendDisplayBitmapRevA(handle windows.Handle, x0, y0, x1, y1 int, img image.Image) error {
+func SendDisplayBitmapRevA(handle windows.Handle, x0, y0, x1, y1 int, img image.Image) error {
 	header := []byte{
 		byte(x0 >> 2),
 		byte(((x0 & 3) << 6) | (y0 >> 4)),
@@ -341,10 +341,10 @@ var (
 	createDXGIFactory1    = dxgiDLL.NewProc("CreateDXGIFactory1")
 )
 
-type gpuStats struct {
-	usedBytes  uint64
-	totalBytes uint64
-	utilPct    float64
+type GpuStats struct {
+	UsedBytes  uint64
+	TotalBytes uint64
+	UtilPct    float64
 }
 
 type dxgiQueryVideoMemoryInfo struct {
@@ -365,7 +365,7 @@ type pdhFmtCounterValueItem struct {
 	FmtValue pdhFmtCounterValue
 }
 
-type gpuPdhQuery struct {
+type GpuPdhQuery struct {
 	handle      windows.Handle
 	memory      windows.Handle
 	engine      windows.Handle
@@ -447,39 +447,39 @@ type dxgiAdapter3Vtbl struct {
 	unregisterBudgetChange    uintptr
 }
 
-func newGpuPdhQuery() (*gpuPdhQuery, error) {
+func NewGpuPdhQuery() (*GpuPdhQuery, error) {
 	var h windows.Handle
 	status, _, _ := pdhOpenQueryW.Call(0, 0, uintptr(unsafe.Pointer(&h)))
 	if status != 0 {
 		return nil, fmt.Errorf("PdhOpenQueryW: 0x%08X", status)
 	}
 
-	q := &gpuPdhQuery{handle: h}
+	q := &GpuPdhQuery{handle: h}
 	if err := q.addCounter(`\GPU Adapter Memory(*)\Dedicated Usage`, &q.memory); err != nil {
-		q.close()
+		q.Close()
 		return nil, err
 	}
 	if err := q.addCounter(`\GPU Engine(*)\Utilization Percentage`, &q.engine); err != nil {
-		q.close()
+		q.Close()
 		return nil, err
 	}
 
 	totalBytes, err := readPrimaryAdapterDedicatedVideoMemory()
 	if err != nil {
-		q.close()
+		q.Close()
 		return nil, err
 	}
 	q.totalBytes = totalBytes
 
 	if err := q.collect(); err != nil {
-		q.close()
+		q.Close()
 		return nil, err
 	}
 	q.initialized = true
 	return q, nil
 }
 
-func (q *gpuPdhQuery) addCounter(path string, out *windows.Handle) error {
+func (q *GpuPdhQuery) addCounter(path string, out *windows.Handle) error {
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return err
@@ -496,7 +496,7 @@ func (q *gpuPdhQuery) addCounter(path string, out *windows.Handle) error {
 	return nil
 }
 
-func (q *gpuPdhQuery) collect() error {
+func (q *GpuPdhQuery) collect() error {
 	status, _, _ := pdhCollectQueryData.Call(uintptr(q.handle))
 	if status != 0 {
 		return fmt.Errorf("PdhCollectQueryData: 0x%08X", status)
@@ -504,14 +504,14 @@ func (q *gpuPdhQuery) collect() error {
 	return nil
 }
 
-func (q *gpuPdhQuery) close() {
+func (q *GpuPdhQuery) Close() {
 	if q.handle != 0 {
 		pdhCloseQuery.Call(uintptr(q.handle))
 		q.handle = 0
 	}
 }
 
-func (q *gpuPdhQuery) formattedArray(counter windows.Handle, format uint32) ([]pdhFmtCounterValueItem, error) {
+func (q *GpuPdhQuery) formattedArray(counter windows.Handle, format uint32) ([]pdhFmtCounterValueItem, error) {
 	var bufSize uint32
 	var itemCount uint32
 
@@ -555,49 +555,48 @@ func (v pdhFmtCounterValue) asFloat64() float64 {
 	return *(*float64)(unsafe.Pointer(&v.LargeValue))
 }
 
-func (q *gpuPdhQuery) snapshot() (gpuStats, error) {
+func (q *GpuPdhQuery) Snapshot() (GpuStats, error) {
 	if !q.initialized {
-		return gpuStats{}, fmt.Errorf("PDH query not initialized")
+		return GpuStats{}, fmt.Errorf("PDH query not initialized")
 	}
 	if err := q.collect(); err != nil {
-		return gpuStats{}, err
+		return GpuStats{}, err
 	}
 
 	memItems, err := q.formattedArray(q.memory, pdhFmtLarge)
 	if err != nil {
-		return gpuStats{}, err
+		return GpuStats{}, err
 	}
 	engineItems, err := q.formattedArray(q.engine, pdhFmtDouble)
 	if err != nil {
-		return gpuStats{}, err
+		return GpuStats{}, err
 	}
 
-	var stats gpuStats
+	var stats GpuStats
 	if len(memItems) > 0 {
-		stats.usedBytes = uint64(memItems[0].FmtValue.LargeValue)
+		stats.UsedBytes = uint64(memItems[0].FmtValue.LargeValue)
 	}
-	stats.totalBytes = q.totalBytes
+	stats.TotalBytes = q.totalBytes
 
-	dbg.Printf("[gpu] pdh memory samples: %d", len(memItems))
 	for i, item := range memItems {
 		name := windows.UTF16PtrToString(item.Name)
 		val := uint64(item.FmtValue.LargeValue)
-		dbg.Printf("[gpu]   mem[%d] %q = %s (%d)", i, name, formatBytesGiB(val), val)
+		_ = i
+		_ = name
+		_ = val
 	}
 
 	var maxUtil float64
-	dbg.Printf("[gpu] pdh engine samples: %d", len(engineItems))
 	for _, item := range engineItems {
 		name := windows.UTF16PtrToString(item.Name)
 		val := item.FmtValue.asFloat64()
-		dbg.Printf("[gpu]   eng %q = %.2f", name, val)
 		// GPU Engine counter names contain "engtype_" (e.g. engtype_3d, engtype_VideoDecode, engtype_Copy, etc.)
 		// Take the max across ALL engine types for an overall utilization figure.
 		if strings.Contains(strings.ToLower(name), "engtype_") && val > maxUtil {
 			maxUtil = val
 		}
 	}
-	stats.utilPct = maxUtil
+	stats.UtilPct = maxUtil
 	return stats, nil
 }
 
@@ -721,14 +720,9 @@ func readPrimaryAdapterDedicatedVideoMemory() (uint64, error) {
 		return 0, fmt.Errorf("QueryVideoMemoryInfo: 0x%08X", hr)
 	}
 
-	dbg.Printf("[gpu] adapter=0 name=%q vendor=0x%04X device=0x%04X dedicated=%s shared=%s",
-		adapterName, desc.VendorID, desc.DeviceID,
-		formatBytesGiB(desc.DedicatedVideoMemory), formatBytesGiB(desc.SharedSystemMemory))
-	dbg.Printf("[gpu] dxgi local budget=%s current=%s available=%s reservation=%s",
-		formatBytesGiB(info.Budget),
-		formatBytesGiB(info.CurrentUsage),
-		formatBytesGiB(info.AvailableForReservation),
-		formatBytesGiB(info.CurrentReservation))
+	_ = adapterName
+	_ = desc
+	_ = info
 
 	return desc.DedicatedVideoMemory, nil
 }
@@ -743,10 +737,10 @@ var (
 	globalMemoryStatusEx = kernel32DLL.NewProc("GlobalMemoryStatusEx")
 )
 
-type systemMemoryStats struct {
-	usedBytes  uint64
-	totalBytes uint64
-	loadPct    float64
+type SystemMemoryStats struct {
+	UsedBytes  uint64
+	TotalBytes uint64
+	LoadPct    float64
 }
 
 type fileTime struct {
@@ -770,31 +764,31 @@ type memoryStatusEx struct {
 	ullAvailExtendedVirtual uint64
 }
 
-type cpuUsageSampler struct {
+type CpuUsageSampler struct {
 	lastIdle    uint64
 	lastKernel  uint64
 	lastUser    uint64
 	initialized bool
 }
 
-func readSystemMemoryStats() (systemMemoryStats, error) {
+func ReadSystemMemoryStats() (SystemMemoryStats, error) {
 	var mem memoryStatusEx
 	mem.dwLength = uint32(unsafe.Sizeof(mem))
 
 	r1, _, err := globalMemoryStatusEx.Call(uintptr(unsafe.Pointer(&mem)))
 	if r1 == 0 {
-		return systemMemoryStats{}, fmt.Errorf("GlobalMemoryStatusEx: %w", err)
+		return SystemMemoryStats{}, fmt.Errorf("GlobalMemoryStatusEx: %w", err)
 	}
 
-	return systemMemoryStats{
-		usedBytes:  mem.ullTotalPhys - mem.ullAvailPhys,
-		totalBytes: mem.ullTotalPhys,
-		loadPct:    float64(mem.dwMemoryLoad),
+	return SystemMemoryStats{
+		UsedBytes:  mem.ullTotalPhys - mem.ullAvailPhys,
+		TotalBytes: mem.ullTotalPhys,
+		LoadPct:    float64(mem.dwMemoryLoad),
 	}, nil
 }
 
-func newCpuUsageSampler() (*cpuUsageSampler, error) {
-	s := &cpuUsageSampler{}
+func NewCpuUsageSampler() (*CpuUsageSampler, error) {
+	s := &CpuUsageSampler{}
 	idle, kernel, user, err := s.readTimes()
 	if err != nil {
 		return nil, err
@@ -806,7 +800,7 @@ func newCpuUsageSampler() (*cpuUsageSampler, error) {
 	return s, nil
 }
 
-func (s *cpuUsageSampler) readTimes() (idle, kernel, user uint64, err error) {
+func (s *CpuUsageSampler) readTimes() (idle, kernel, user uint64, err error) {
 	var idleFT, kernelFT, userFT fileTime
 	r1, _, callErr := getSystemTimes.Call(
 		uintptr(unsafe.Pointer(&idleFT)),
@@ -819,7 +813,7 @@ func (s *cpuUsageSampler) readTimes() (idle, kernel, user uint64, err error) {
 	return idleFT.uint64(), kernelFT.uint64(), userFT.uint64(), nil
 }
 
-func (s *cpuUsageSampler) snapshot() (float64, error) {
+func (s *CpuUsageSampler) Snapshot() (float64, error) {
 	idle, kernel, user, err := s.readTimes()
 	if err != nil {
 		return 0, err
@@ -871,11 +865,11 @@ func (s *cpuUsageSampler) snapshot() (float64, error) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-func formatBytesGiB(b uint64) string {
+func FormatBytesGiB(b uint64) string {
 	return fmt.Sprintf("%.1f GiB", float64(b)/(1024*1024*1024))
 }
 
-func interpretHello(resp []byte) string {
+func InterpretHello(resp []byte) string {
 	if len(resp) == 0 {
 		return "No response received — device may be disconnected or on wrong baud rate"
 	}
