@@ -63,7 +63,7 @@ func TestLoadConfigBadJSON(t *testing.T) {
 
 func TestNewChartCapacity(t *testing.T) {
 	cfg := GraphConfig{X: 10, Y: 20, Width: 100, Height: 50}
-	c := newChart(cfg, 5, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
+	c := newChart(cfg, 5, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
 	if c.capacity != 20 {
 		t.Errorf("capacity = %d, want 20", c.capacity)
 	}
@@ -80,9 +80,17 @@ func TestNewChartCapacity(t *testing.T) {
 
 func TestNewChartZeroWidth(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 0, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{})
+	c := newChart(cfg, 4, ThresholdConfig{}, false)
 	if c.capacity != 1 {
 		t.Errorf("capacity = %d, want 1 (minimum)", c.capacity)
+	}
+}
+
+func TestNewChartNoLines(t *testing.T) {
+	cfg := GraphConfig{X: 0, Y: 0, Width: 100, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{}, true)
+	if !c.noLines {
+		t.Error("noLines should be true")
 	}
 }
 
@@ -93,7 +101,7 @@ func TestNewChartZeroWidth(t *testing.T) {
 func TestDotColor(t *testing.T) {
 	thresh := ThresholdConfig{Green: 0, Yellow: 50, Red: 80}
 	cfg := GraphConfig{Width: 20, Height: 10}
-	c := newChart(cfg, 4, thresh)
+	c := newChart(cfg, 4, thresh, false)
 
 	tests := []struct {
 		value float64
@@ -132,20 +140,21 @@ func colorName(clr color.RGBA) string {
 }
 
 // ---------------------------------------------------------------------------
-// valueToY — bounding lines at row 0 and height-1, dots in [1..height-2]
+// valueToY (with lines)
 // ---------------------------------------------------------------------------
 
 func TestValueToY(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 100, Height: 100}
-	c := newChart(cfg, 4, ThresholdConfig{})
+	c := newChart(cfg, 4, ThresholdConfig{}, false)
 
+	// With lines: dot top fits in [1, height-dotSize-1] = [1, 95]
 	tests := []struct {
 		value float64
 		want  int
 	}{
-		{0, 98},    // just above bottom line (height-2)
-		{100, 1},   // just below top line
-		{50, 50},   // middle
+		{0, 95},   // 0% → maxDotY (dot occupies 95..98, fits above bottom line at 98)
+		{100, 1},  // 100% → row 1 (dot occupies 1..4, fits below top line at 0)
+		{50, 48},  // 50% → middle
 	}
 	for _, tt := range tests {
 		got := c.valueToY(tt.value)
@@ -156,46 +165,27 @@ func TestValueToY(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// makeDotImage
+// valueToY (no lines — full height)
 // ---------------------------------------------------------------------------
 
-func TestMakeDotImage(t *testing.T) {
-	cfg := GraphConfig{Width: 20, Height: 10}
-	c := newChart(cfg, 4, ThresholdConfig{})
-	clr := color.RGBA{255, 0, 0, 255}
-	img := c.makeDotImage(clr)
+func TestValueToYNoLines(t *testing.T) {
+	cfg := GraphConfig{X: 0, Y: 0, Width: 100, Height: 100}
+	c := newChart(cfg, 4, ThresholdConfig{}, true)
 
-	if img.Bounds().Dx() != 4 || img.Bounds().Dy() != 4 {
-		t.Errorf("bounds = %v, want 4x4", img.Bounds())
+	// No lines: dot top fits in [0, height-dotSize] = [0, 96]
+	tests := []struct {
+		value float64
+		want  int
+	}{
+		{0, 96},   // 0% → maxDotY (dot occupies 96..99, fits in height 100)
+		{100, 0},  // 100% → row 0 (dot occupies 0..3)
+		{50, 48},  // 50% → middle
 	}
-	for y := 0; y < 4; y++ {
-		for x := 0; x < 4; x++ {
-			if img.At(x, y) != clr {
-				t.Errorf("pixel(%d,%d) = %v, want %v", x, y, img.At(x, y), clr)
-			}
+	for _, tt := range tests {
+		got := c.valueToY(tt.value)
+		if got != tt.want {
+			t.Errorf("valueToY(%v) = %d, want %d", tt.value, got, tt.want)
 		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// dotRegion
-// ---------------------------------------------------------------------------
-
-func TestDotRegion(t *testing.T) {
-	cfg := GraphConfig{X: 10, Y: 20, Width: 100, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{})
-	clr := color.RGBA{0, 255, 0, 255}
-	reg := c.dotRegion(3, clr, 50)
-
-	if reg.X != 10+3*4 {
-		t.Errorf("X = %d, want %d", reg.X, 10+3*4)
-	}
-	wantY := 20 + c.valueToY(50)
-	if reg.Y != wantY {
-		t.Errorf("Y = %d, want %d", reg.Y, wantY)
-	}
-	if reg.Image == nil {
-		t.Fatal("Image is nil")
 	}
 }
 
@@ -205,13 +195,11 @@ func TestDotRegion(t *testing.T) {
 
 func TestDrawBoundingLines(t *testing.T) {
 	cfg := GraphConfig{X: 10, Y: 20, Width: 100, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{})
+	c := newChart(cfg, 4, ThresholdConfig{}, false)
 	regions := c.drawBoundingLines()
 	if len(regions) != 2 {
 		t.Fatalf("got %d regions, want 2", len(regions))
 	}
-
-	// Top line
 	top := regions[0]
 	if top.X != 10 || top.Y != 20 {
 		t.Errorf("top line at (%d,%d), want (10,20)", top.X, top.Y)
@@ -219,8 +207,6 @@ func TestDrawBoundingLines(t *testing.T) {
 	if top.Image.Bounds().Dx() != 100 || top.Image.Bounds().Dy() != 1 {
 		t.Errorf("top image size = %dx%d, want 100x1", top.Image.Bounds().Dx(), top.Image.Bounds().Dy())
 	}
-
-	// Bottom line
 	bot := regions[1]
 	if bot.X != 10 || bot.Y != 20+50-1 {
 		t.Errorf("bottom line at (%d,%d), want (10,69)", bot.X, bot.Y)
@@ -236,9 +222,9 @@ func TestDrawBoundingLines(t *testing.T) {
 
 func TestRenderFrame(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
 
-	// Empty chart — renderFrame(50) draws one yellow dot at rightmost col (4)
+	// Empty — one yellow dot at rightmost col (4)
 	colors, values := c.renderFrame(50)
 	if colorName(colors[4]) != "yellow" {
 		t.Errorf("col 4 = %s, want yellow", colorName(colors[4]))
@@ -252,7 +238,7 @@ func TestRenderFrame(t *testing.T) {
 		}
 	}
 
-	// Fill partially: history=[10, 60, 90], new=30 → dots at cols 1..4
+	// Partially filled: history=[10, 60, 90], new=30 → cols 1..4
 	c.history = []float64{10, 60, 90}
 	colors, values = c.renderFrame(30)
 	if colorName(colors[1]) != "green" {
@@ -273,118 +259,318 @@ func TestRenderFrame(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// diff
+// markChanged
 // ---------------------------------------------------------------------------
 
-func TestDiff(t *testing.T) {
+func TestMarkChanged(t *testing.T) {
+	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{}, false)
+	white := color.RGBA{255, 255, 255, 255}
+
+	// col 0: same green, col 1: green→red, col 2: red→white, col 3: white→yellow, col 4: same
+	prevC := []color.RGBA{{0, 255, 0, 255}, {0, 255, 0, 255}, {255, 0, 0, 255}, white, {0, 255, 0, 255}}
+	currC := []color.RGBA{{0, 255, 0, 255}, {255, 0, 0, 255}, white, {255, 255, 0, 255}, {0, 255, 0, 255}}
+	changed := c.markChanged(prevC, currC, []float64{10, 10, 90, 0, 10}, []float64{10, 90, 0, 60, 10})
+
+	if changed[0] {
+		t.Error("col 0 should not be changed (same green, same value)")
+	}
+	if !changed[1] {
+		t.Error("col 1 should be changed (green→red)")
+	}
+	if !changed[2] {
+		t.Error("col 2 should be changed (red→white)")
+	}
+	if !changed[3] {
+		t.Error("col 3 should be changed (white→yellow)")
+	}
+	if changed[4] {
+		t.Error("col 4 should not be changed (same green, same value)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// batchBlocks
+// ---------------------------------------------------------------------------
+
+func TestBatchBlocksSingleDot(t *testing.T) {
 	cfg := GraphConfig{X: 10, Y: 20, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	white := color.RGBA{255, 255, 255, 255}
 
-	prevC := []color.RGBA{
-		{0, 255, 0, 255},  // green
-		{255, 255, 0, 255}, // yellow
-		{255, 0, 0, 255},  // red
-	}
-	prevV := []float64{10, 60, 90}
-	currC := []color.RGBA{
-		{0, 255, 0, 255},  // green (same color, same value)
-		{255, 0, 0, 255},  // red (changed)
-		{255, 0, 0, 255},  // red (same)
-	}
-	currV := []float64{10, 90, 90}
+	changed := []bool{false, false, true, false, false}
+	colors := []color.RGBA{white, white, {0, 255, 0, 255}, white, white}
+	values := []float64{0, 0, 30, 0, 0}
 
-	regions := c.diff(prevC, currC, prevV, currV)
-	// col 1: yellow→red (white-out + draw) = 2 regions
+	regions := c.batchBlocks(changed, colors, values)
+	if len(regions) != 1 {
+		t.Fatalf("got %d regions, want 1", len(regions))
+	}
+	r := regions[0]
+	if r.X != 10+2*4 {
+		t.Errorf("X = %d, want %d", r.X, 10+2*4)
+	}
+	if r.Y != 20 {
+		t.Errorf("Y = %d, want 20", r.Y)
+	}
+	if r.Image.Bounds().Dx() != 4 {
+		t.Errorf("block width = %d, want 4", r.Image.Bounds().Dx())
+	}
+	if r.Image.Bounds().Dy() != 50 {
+		t.Errorf("block height = %d, want 50", r.Image.Bounds().Dy())
+	}
+	// Dot should be green at correct Y
+	dotY := c.valueToY(30)
+	if clr, ok := r.Image.At(0, dotY).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Errorf("dot colour = %v, want green", r.Image.At(0, dotY))
+	}
+}
+
+func TestBatchBlocksContiguous(t *testing.T) {
+	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	white := color.RGBA{255, 255, 255, 255}
+
+	// cols 1,2,3 changed → one block
+	changed := []bool{false, true, true, true, false}
+	colors := []color.RGBA{white, {0, 255, 0, 255}, {255, 255, 0, 255}, {255, 0, 0, 255}, white}
+	values := []float64{0, 20, 50, 80, 0}
+
+	regions := c.batchBlocks(changed, colors, values)
+	if len(regions) != 1 {
+		t.Fatalf("got %d regions, want 1 (contiguous)", len(regions))
+	}
+	r := regions[0]
+	if r.X != 4 {
+		t.Errorf("X = %d, want 4", r.X)
+	}
+	if r.Image.Bounds().Dx() != 12 {
+		t.Errorf("block width = %d, want 12 (3 cols × 4px)", r.Image.Bounds().Dx())
+	}
+}
+
+func TestBatchBlocksNonContiguous(t *testing.T) {
+	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	white := color.RGBA{255, 255, 255, 255}
+
+	// cols 0,1 changed, col 2 white, cols 3,4 changed → 2 blocks
+	changed := []bool{true, true, false, true, true}
+	colors := []color.RGBA{
+		{0, 255, 0, 255}, {0, 255, 0, 255}, white, {255, 0, 0, 255}, {255, 0, 0, 255},
+	}
+	values := []float64{20, 20, 0, 80, 80}
+
+	regions := c.batchBlocks(changed, colors, values)
 	if len(regions) != 2 {
-		t.Fatalf("diff: got %d regions, want 2", len(regions))
+		t.Fatalf("got %d regions, want 2 (non-contiguous)", len(regions))
+	}
+	// Block 1: cols 0-1
+	if regions[0].X != 0 {
+		t.Errorf("block 1 X = %d, want 0", regions[0].X)
+	}
+	if regions[0].Image.Bounds().Dx() != 8 {
+		t.Errorf("block 1 width = %d, want 8", regions[0].Image.Bounds().Dx())
+	}
+	// Block 2: cols 3-4
+	if regions[1].X != 12 {
+		t.Errorf("block 2 X = %d, want 12", regions[1].X)
+	}
+	if regions[1].Image.Bounds().Dx() != 8 {
+		t.Errorf("block 2 width = %d, want 8", regions[1].Image.Bounds().Dx())
 	}
 }
 
-func TestDiffNoChanges(t *testing.T) {
+func TestBatchBlocksWhiteOut(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{})
-
-	prevC := []color.RGBA{{0, 255, 0, 255}, {0, 255, 0, 255}}
-	currC := []color.RGBA{{0, 255, 0, 255}, {0, 255, 0, 255}}
-	regions := c.diff(prevC, currC, []float64{10, 10}, []float64{10, 10})
-	if len(regions) != 0 {
-		t.Errorf("no-change diff: got %d regions, want 0", len(regions))
-	}
-}
-
-func TestDiffNewDots(t *testing.T) {
-	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
-
+	c := newChart(cfg, 4, ThresholdConfig{}, false)
 	white := color.RGBA{255, 255, 255, 255}
-	// prev: col 0 = green, col 1 = white
-	prevC := []color.RGBA{{0, 255, 0, 255}, white}
-	currC := []color.RGBA{{0, 255, 0, 255}, {255, 255, 0, 255}}
-	regions := c.diff(prevC, currC, []float64{10, 0}, []float64{10, 60})
-	// col 1: white→yellow = 1 region
-	if len(regions) != 1 {
-		t.Fatalf("new dot diff: got %d regions, want 1", len(regions))
-	}
-	if regions[0].X != 4 {
-		t.Errorf("new dot X = %d, want 4", regions[0].X)
-	}
-}
 
-func TestDiffWhiteOut(t *testing.T) {
-	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
+	// col 0: green→white (white-out), col 1: white (unchanged)
+	changed := []bool{true, false, false, false, false}
+	colors := []color.RGBA{white, white, white, white, white}
+	values := []float64{0, 0, 0, 0, 0}
 
-	white := color.RGBA{255, 255, 255, 255}
-	// prev: col 0 = green(30), col 1 = red(90)
-	prevC := []color.RGBA{{0, 255, 0, 255}, {255, 0, 0, 255}}
-	// curr: col 0 = green(30), col 1 = white (dot dropped)
-	currC := []color.RGBA{{0, 255, 0, 255}, white}
-	regions := c.diff(prevC, currC, []float64{30, 90}, []float64{30, 0})
-	// col 1: red→white = 1 white-out region
+	regions := c.batchBlocks(changed, colors, values)
+	// White-out is white on white background → block is all white but still sent
 	if len(regions) != 1 {
-		t.Fatalf("white-out diff: got %d regions, want 1", len(regions))
-	}
-	// White-out should be at old Y (value 90 = top of graph)
-	wantY := 0 + c.valueToY(90)
-	if regions[0].Y != wantY {
-		t.Errorf("white-out Y = %d, want %d (old dot position)", regions[0].Y, wantY)
-	}
-	// Image should be white
-	if clr := regions[0].Image.At(0, 0); clr != white {
-		t.Errorf("white-out colour = %v, want white", clr)
+		t.Fatalf("got %d regions, want 1", len(regions))
 	}
 }
 
 // ---------------------------------------------------------------------------
-// update — fill phase
+// renderFullBlock (with lines)
+// ---------------------------------------------------------------------------
+
+func TestRenderFullBlockWithLines(t *testing.T) {
+	cfg := GraphConfig{X: 10, Y: 20, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+
+	white := color.RGBA{255, 255, 255, 255}
+	colors := []color.RGBA{
+		{0, 255, 0, 255}, {255, 255, 0, 255}, {255, 0, 0, 255}, white, white,
+	}
+	values := []float64{20, 50, 80, 0, 0}
+
+	r := c.renderFullBlock(colors, values, true)
+	if r.X != 10 || r.Y != 20 {
+		t.Errorf("block at (%d,%d), want (10,20)", r.X, r.Y)
+	}
+	if r.Image.Bounds().Dx() != 20 || r.Image.Bounds().Dy() != 50 {
+		t.Errorf("block size = %dx%d, want 20x50", r.Image.Bounds().Dx(), r.Image.Bounds().Dy())
+	}
+	// Top line should be grey
+	if clr, ok := r.Image.At(0, 0).(color.RGBA); !ok || colorName(clr) != "grey" {
+		t.Errorf("top line not grey")
+	}
+	// Bottom line should be grey
+	if clr, ok := r.Image.At(0, 49).(color.RGBA); !ok || colorName(clr) != "grey" {
+		t.Errorf("bottom line not grey")
+	}
+	// Dot at col 0 should be green (dot top at valueToY(20), full dot spans dotSize rows)
+	dotY := c.valueToY(20)
+	if clr, ok := r.Image.At(0, dotY).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Errorf("col 0 dot top not green at y=%d", dotY)
+	}
+	// Dot at col 2 should be red
+	dotY = c.valueToY(80)
+	if clr, ok := r.Image.At(8, dotY).(color.RGBA); !ok || colorName(clr) != "red" {
+		t.Errorf("col 2 dot top not red at y=%d", dotY)
+	}
+}
+
+func TestRenderFullBlockWithoutLines(t *testing.T) {
+	cfg := GraphConfig{X: 10, Y: 20, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+
+	white := color.RGBA{255, 255, 255, 255}
+	colors := []color.RGBA{
+		{0, 255, 0, 255}, white, white, white, white,
+	}
+	values := []float64{30, 0, 0, 0, 0}
+
+	r := c.renderFullBlock(colors, values, false)
+	// Block should skip line rows: Y starts at row 1, height = 48
+	if r.X != 10 || r.Y != 21 {
+		t.Errorf("block at (%d,%d), want (10,21)", r.X, r.Y)
+	}
+	if r.Image.Bounds().Dy() != 48 {
+		t.Errorf("block height = %d, want 48 (no line rows)", r.Image.Bounds().Dy())
+	}
+	// Dot at col 0, value 30: valueToY(30) = some value, minus yOffset(1)
+	dotY := c.valueToY(30) - 1
+	if clr, ok := r.Image.At(0, dotY).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Errorf("col 0 dot not green at y=%d", dotY)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// renderFullBlock (noLines mode)
+// ---------------------------------------------------------------------------
+
+func TestRenderFullBlockNoLines(t *testing.T) {
+	cfg := GraphConfig{X: 10, Y: 20, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, true)
+
+	white := color.RGBA{255, 255, 255, 255}
+	colors := []color.RGBA{
+		{0, 255, 0, 255}, {255, 255, 0, 255}, {255, 0, 0, 255}, white, white,
+	}
+	values := []float64{20, 50, 80, 0, 0}
+
+	// Even with drawLines=true, noLines chart should NOT draw lines.
+	r := c.renderFullBlock(colors, values, true)
+	if r.X != 10 || r.Y != 20 {
+		t.Errorf("block at (%d,%d), want (10,20)", r.X, r.Y)
+	}
+	if r.Image.Bounds().Dx() != 20 || r.Image.Bounds().Dy() != 50 {
+		t.Errorf("block size = %dx%d, want 20x50", r.Image.Bounds().Dx(), r.Image.Bounds().Dy())
+	}
+	// No lines — top row should NOT be grey
+	if clr, ok := r.Image.At(0, 0).(color.RGBA); !ok || colorName(clr) == "grey" {
+		t.Errorf("top row should not be grey in noLines mode")
+	}
+	// Dot at col 0 should be green at valueToY(20) (full height mapping)
+	dotY := c.valueToY(20)
+	if clr, ok := r.Image.At(0, dotY).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Errorf("col 0 dot not green at y=%d", dotY)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// update — fill phase (with lines)
 // ---------------------------------------------------------------------------
 
 func TestUpdateFillPhase(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
-	// capacity = 5, dots fill from right (col 4 → col 0)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
 
-	// First update — one dot at col 4 + 2 bounding lines = 3 regions
+	// First update: lines drawn, block covers full height (50px)
 	regions := c.update(30)
-	if len(regions) != 3 {
-		t.Fatalf("first update: got %d regions, want 3 (dot + 2 lines)", len(regions))
+	if len(regions) != 1 {
+		t.Fatalf("first update: got %d regions, want 1", len(regions))
 	}
-	if !c.linesDrawn {
-		t.Error("lines should be drawn after first update")
+	if regions[0].Image.Bounds().Dy() != 50 {
+		t.Errorf("first block height = %d, want 50 (with lines)", regions[0].Image.Bounds().Dy())
+	}
+	// Top line should be grey
+	if clr, ok := regions[0].Image.At(0, 0).(color.RGBA); !ok || colorName(clr) != "grey" {
+		t.Errorf("first update: top line not grey")
 	}
 
-	// Second update — all dots shift left, every dot changes
-	regions = c.update(60)
-	if len(regions) < 1 {
-		t.Fatal("second update: expected at least 1 region")
+	// Second update: no lines, block covers rows 1..48 only (48px)
+	regions = c.update(30)
+	if len(regions) != 1 {
+		t.Fatalf("second update: got %d regions, want 1", len(regions))
+	}
+	if regions[0].Image.Bounds().Dy() != 48 {
+		t.Errorf("second block height = %d, want 48 (no lines)", regions[0].Image.Bounds().Dy())
+	}
+	// Block Y should skip row 0 (the line row)
+	if regions[0].Y != 1 {
+		t.Errorf("second block Y = %d, want 1", regions[0].Y)
 	}
 
 	// Fill remaining
-	c.update(90)  // 3 dots now
-	c.update(10)  // 4 dots now
-	c.update(40)  // 5 dots, now filled
+	for i := 0; i < 3; i++ {
+		c.update(30)
+	}
 	if !c.filled {
-		t.Error("chart should be filled now")
+		t.Error("should be filled")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// update — fill phase (noLines mode)
+// ---------------------------------------------------------------------------
+
+func TestUpdateFillPhaseNoLines(t *testing.T) {
+	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, true)
+
+	// First update: no lines, block covers full height (50px)
+	regions := c.update(30)
+	if len(regions) != 1 {
+		t.Fatalf("first update: got %d regions, want 1", len(regions))
+	}
+	if regions[0].Image.Bounds().Dy() != 50 {
+		t.Errorf("first block height = %d, want 50 (full height, no lines)", regions[0].Image.Bounds().Dy())
+	}
+	// No grey lines
+	if clr, ok := regions[0].Image.At(0, 0).(color.RGBA); !ok || colorName(clr) == "grey" {
+		t.Errorf("should not have grey lines in noLines mode")
+	}
+
+	// Second update: still full height
+	regions = c.update(30)
+	if len(regions) != 1 {
+		t.Fatalf("second update: got %d regions, want 1", len(regions))
+	}
+	if regions[0].Image.Bounds().Dy() != 50 {
+		t.Errorf("second block height = %d, want 50", regions[0].Image.Bounds().Dy())
+	}
+	if regions[0].Y != 0 {
+		t.Errorf("second block Y = %d, want 0", regions[0].Y)
 	}
 }
 
@@ -394,65 +580,32 @@ func TestUpdateFillPhase(t *testing.T) {
 
 func TestUpdateShiftPhase(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
 
-	// Fill the chart with green dots
 	for i := 0; i < 5; i++ {
 		c.update(30)
 	}
-	if !c.filled {
-		t.Fatal("should be filled")
-	}
 
-	// Next update — shift: col 4: green(30)→red(90) = white-out + draw = 2 regions
 	regions := c.update(90)
-	if len(regions) != 2 {
-		t.Fatalf("shift update: got %d regions, want 2", len(regions))
+	if len(regions) != 1 {
+		t.Fatalf("shift update: got %d regions, want 1", len(regions))
 	}
 }
 
 // ---------------------------------------------------------------------------
-// update — diffing (no change = no regions)
+// update — no change (DEBUG mode: still sends full block)
 // ---------------------------------------------------------------------------
 
 func TestUpdateNoChange(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
 
-	// Fill with same value
 	for i := 0; i < 5; i++ {
 		c.update(30)
 	}
-
-	// Same value again — all dots shift but colours stay the same
 	regions := c.update(30)
-	if len(regions) != 0 {
-		t.Errorf("same value update: got %d regions, want 0", len(regions))
-	}
-}
-
-// ---------------------------------------------------------------------------
-// update — colour change produces dirty regions
-// ---------------------------------------------------------------------------
-
-func TestUpdateColorChange(t *testing.T) {
-	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
-
-	// Fill with green
-	for i := 0; i < 5; i++ {
-		c.update(10)
-	}
-
-	// Now push red — col 4: green(10)→red(90) = white-out + draw = 2
-	regions := c.update(90)
-	if len(regions) != 2 {
-		t.Fatalf("colour change: got %d regions, want 2", len(regions))
-	}
-	// Last region should be the red dot
-	lastClr := regions[len(regions)-1].Image.At(0, 0)
-	if lastClr != (color.RGBA{R: 255, G: 0, B: 0, A: 255}) {
-		t.Errorf("last region should be red, got %v", lastClr)
+	if len(regions) != 1 {
+		t.Errorf("same value update: got %d regions, want 1 (DEBUG full block)", len(regions))
 	}
 }
 
@@ -462,42 +615,66 @@ func TestUpdateColorChange(t *testing.T) {
 
 func TestUpdateClamping(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
 
-	c.update(-10) // clamped to 0, green at col 4
-	regions := c.update(150) // clamped to 100, red at col 4, green at col 3
-	// col 3: white→green (draw), col 4: green→red (white-out + draw) = 3
-	if len(regions) != 3 {
-		t.Fatalf("clamping: got %d regions, want 3", len(regions))
-	}
-	// Last region should be the red dot
-	lastClr := regions[len(regions)-1].Image.At(0, 0)
-	if lastClr != (color.RGBA{R: 255, G: 0, B: 0, A: 255}) {
-		t.Errorf("last region should be red, got %v", lastClr)
+	c.update(-10)
+	regions := c.update(150)
+	if len(regions) != 1 {
+		t.Fatalf("clamping: got %d regions, want 1", len(regions))
 	}
 }
 
 // ---------------------------------------------------------------------------
-// update — shift with varying values (regression test)
+// update — varying values
 // ---------------------------------------------------------------------------
 
 func TestUpdateShiftVarying(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80})
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
 
-	// Fill: [10, 10, 10, 10, 10]
 	for i := 0; i < 5; i++ {
 		c.update(10)
 	}
-
-	// Push 90: history becomes [10, 10, 10, 10, 90]
 	c.update(90)
-
-	// Push 50: history becomes [10, 10, 10, 90, 50]
-	// col 0: green→white (white-out), col 3: green→red (white-out + draw),
-	// col 4: red→yellow (white-out + draw) = 5 regions
 	regions := c.update(50)
-	if len(regions) < 1 {
-		t.Fatal("varying shift: expected at least 1 region")
+	if len(regions) != 1 {
+		t.Fatalf("varying shift: got %d regions, want 1", len(regions))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: dots render right-aligned, shift seamlessly
+// ---------------------------------------------------------------------------
+
+func TestUpdateRightAlignedFill(t *testing.T) {
+	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+
+	// First dot — full block with lines
+	regions := c.update(30)
+	if len(regions) != 1 {
+		t.Fatal("first update: expected 1 region")
+	}
+	if regions[0].X != 0 {
+		t.Errorf("block X = %d, want 0", regions[0].X)
+	}
+	// Verify dot is at rightmost column (col 4)
+	dotY := c.valueToY(30)
+	if clr, ok := regions[0].Image.At(16, dotY).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Errorf("dot at col 4 not green")
+	}
+
+	// Second dot — block without lines (offset Y by 1)
+	regions = c.update(30)
+	if len(regions) != 1 {
+		t.Fatal("second update: expected 1 region")
+	}
+	// Verify dots at cols 3 and 4 (yOffset = 1)
+	dotY2 := c.valueToY(30) - 1
+	if clr, ok := regions[0].Image.At(12, dotY2).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Errorf("dot at col 3 not green")
+	}
+	if clr, ok := regions[0].Image.At(16, dotY2).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Errorf("dot at col 4 not green")
 	}
 }

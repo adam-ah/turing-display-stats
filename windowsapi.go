@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
-	"log"
 	"strconv"
 	"strings"
 	"syscall"
@@ -579,24 +578,26 @@ func (q *gpuPdhQuery) snapshot() (gpuStats, error) {
 	}
 	stats.totalBytes = q.totalBytes
 
-	log.Printf("[gpu] pdh memory samples: %d", len(memItems))
+	dbg.Printf("[gpu] pdh memory samples: %d", len(memItems))
 	for i, item := range memItems {
 		name := windows.UTF16PtrToString(item.Name)
 		val := uint64(item.FmtValue.LargeValue)
-		log.Printf("[gpu]   mem[%d] %q = %s (%d)", i, name, formatBytesGiB(val), val)
+		dbg.Printf("[gpu]   mem[%d] %q = %s (%d)", i, name, formatBytesGiB(val), val)
 	}
 
-	var max3D float64
-	log.Printf("[gpu] pdh engine samples: %d", len(engineItems))
+	var maxUtil float64
+	dbg.Printf("[gpu] pdh engine samples: %d", len(engineItems))
 	for _, item := range engineItems {
 		name := windows.UTF16PtrToString(item.Name)
 		val := item.FmtValue.asFloat64()
-		log.Printf("[gpu]   eng %q = %.2f", name, val)
-		if strings.Contains(strings.ToLower(name), "engtype_3d") && val > max3D {
-			max3D = val
+		dbg.Printf("[gpu]   eng %q = %.2f", name, val)
+		// GPU Engine counter names contain "engtype_" (e.g. engtype_3d, engtype_VideoDecode, engtype_Copy, etc.)
+		// Take the max across ALL engine types for an overall utilization figure.
+		if strings.Contains(strings.ToLower(name), "engtype_") && val > maxUtil {
+			maxUtil = val
 		}
 	}
-	stats.utilPct = max3D
+	stats.utilPct = maxUtil
 	return stats, nil
 }
 
@@ -720,10 +721,10 @@ func readPrimaryAdapterDedicatedVideoMemory() (uint64, error) {
 		return 0, fmt.Errorf("QueryVideoMemoryInfo: 0x%08X", hr)
 	}
 
-	log.Printf("[gpu] adapter=0 name=%q vendor=0x%04X device=0x%04X dedicated=%s shared=%s",
+	dbg.Printf("[gpu] adapter=0 name=%q vendor=0x%04X device=0x%04X dedicated=%s shared=%s",
 		adapterName, desc.VendorID, desc.DeviceID,
 		formatBytesGiB(desc.DedicatedVideoMemory), formatBytesGiB(desc.SharedSystemMemory))
-	log.Printf("[gpu] dxgi local budget=%s current=%s available=%s reservation=%s",
+	dbg.Printf("[gpu] dxgi local budget=%s current=%s available=%s reservation=%s",
 		formatBytesGiB(info.Budget),
 		formatBytesGiB(info.CurrentUsage),
 		formatBytesGiB(info.AvailableForReservation),

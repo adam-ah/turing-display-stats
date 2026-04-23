@@ -7,9 +7,9 @@
     "red":    80
   },
   "graphs": {
-    "cpu": {
-      "x": 10, "y": 180,
-      "width": 300, "height": 200
-    }
+    "cpu":  { "x": 10, "y": 16,  "width": 300, "height": 96 },
+    "ram":  { "x": 10, "y": 136, "width": 300, "height": 96 },
+    "gpu":  { "x": 10, "y": 256, "width": 300, "height": 96 },
+    "vram": { "x": 10, "y": 376, "width": 300, "height": 96 }
   }
 }

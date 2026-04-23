@@ -1,9 +1,11 @@
 //go:build windows
 
 // turing-display-go: Communicate with Turing Smart Screen displays from Go.
+// Build: go build -ldflags="-H windowsgui" -o turing-display.exe
 package main
 
 import (
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -11,6 +13,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,150 +22,162 @@ import (
 	"golang.org/x/image/math/fixed"
 )
 
-func renderTextImage(width, height int, text string) *image.RGBA {
-	canvas := image.NewRGBA(image.Rect(0, 0, width, height))
-	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.White}, image.Point{}, draw.Src)
+// ---------------------------------------------------------------------------
+// Debug logger — only writes when --debug is set
+// ---------------------------------------------------------------------------
 
-	face := basicfont.Face7x13
-	d := &font.Drawer{
-		Dst:  canvas,
-		Src:  image.NewUniform(color.Black),
-		Face: face,
-	}
-	textWidth := d.MeasureString(text).Ceil()
-	metrics := face.Metrics()
-	x := (width - textWidth) / 2
-	y := (height + metrics.Ascent.Ceil() - metrics.Descent.Ceil()) / 2
-	d.Dot = fixed.P(x, y)
-	d.DrawString(text)
-	return canvas
+var debugEnabled bool
+
+func init() {
+	flag.BoolVar(&debugEnabled, "debug", false, "enable console output")
 }
 
-func renderTextBox(width, height int, text string) *image.RGBA {
-	canvas := image.NewRGBA(image.Rect(0, 0, width, height))
-	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.White}, image.Point{}, draw.Src)
-
-	face := basicfont.Face7x13
-	d := &font.Drawer{
-		Dst:  canvas,
-		Src:  image.NewUniform(color.Black),
-		Face: face,
-	}
-	metrics := face.Metrics()
-	textWidth := d.MeasureString(text).Ceil()
-	x := (width - textWidth) / 2
-	y := (height + metrics.Ascent.Ceil() - metrics.Descent.Ceil()) / 2
-	d.Dot = fixed.P(x, y)
-	d.DrawString(text)
-	return canvas
+type debugLogger struct {
+	mu sync.Mutex
 }
+
+func (l *debugLogger) Printf(format string, v ...interface{}) {
+	if !debugEnabled {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	log.Printf(format, v...)
+}
+
+var dbg debugLogger
+
+// ---------------------------------------------------------------------------
+// Screen constants
+// ---------------------------------------------------------------------------
+
+const (
+	screenWidth  = 320
+	screenHeight = 480
+	divColor     = 0x80 // gray divider color (RGB 128,128,128)
+)
+
+// Layout constants per section (120px each).
+const (
+	sectionHeight   = 120
+	labelZoneHeight = 15 // rows 1..15 after divider (textH=13 + 2px padding)
+	chartOffset     = 16 // chart starts at sectionStart + 16
+)
+
+// sectionStart returns the top row of each section.
+var sectionStart = [4]int{0, 120, 240, 360}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 func main() {
+	flag.Parse()
 	log.SetFlags(0)
 
-	fmt.Println("=== Turing Smart Screen — Go Hello ===")
-	fmt.Println()
+	dbg.Printf("=== Turing Smart Screen ===")
+
+	// Init tray icon
+	if err := initTray(); err != nil {
+		dbg.Printf("tray init warning: %v", err)
+	} else {
+		defer removeTray()
+	}
 
 	// 1. Find the device
-	fmt.Println("[1/3] Scanning for Turing display...")
+	dbg.Printf("Scanning for Turing display...")
 	comPort, devName, err := findTuringDisplay()
 	if err != nil {
-		log.Fatalf("Error: %v", err)
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
 	}
-	fmt.Printf("  Found: %s\n", devName)
-	fmt.Printf("  COM port: %s\n", comPort)
-	fmt.Println()
+	dbg.Printf("Found: %s on %s", devName, comPort)
 
 	// 2. Open serial connection
-	fmt.Println("[2/3] Opening serial port at 115200 baud...")
+	dbg.Printf("Opening serial port at 115200 baud...")
 	handle, err := openSerial(comPort)
 	if err != nil {
-		log.Fatalf("Error: %v", err)
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
 	}
 	defer closeSerial(handle)
-	fmt.Println("  Serial port opened successfully.")
-	fmt.Println()
+	dbg.Printf("Serial port opened.")
 
-	// 3. Send HELLO and read response
-	fmt.Println("[3/3] Sending HELLO handshake (6 × 0x45)...")
+	// 3. Send HELLO handshake
+	dbg.Printf("Sending HELLO handshake...")
 	resp, err := sendHello(handle)
 	if err != nil {
-		log.Fatalf("Error: %v", err)
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
 	}
+	dbg.Printf("Response (%d bytes): %s", len(resp), interpretHello(resp))
 
-	fmt.Printf("  Response (%d bytes): ", len(resp))
-	for _, b := range resp {
-		fmt.Printf("%02X ", b)
-	}
-	fmt.Println()
-	fmt.Println()
-	fmt.Printf("  → %s\n", interpretHello(resp))
-	fmt.Println()
-	fmt.Println("Done!")
-
-	// 4. Render hello + live stats
-	fmt.Println()
-	fmt.Println("[4/4] Rendering hello + live GPU/RAM/CPU stats...")
-
-	// Load chart config
+	// 4. Load config
 	chartCfg, err := loadConfig("config.json")
 	if err != nil {
-		log.Printf("Warning: could not load config.json: %v — charts disabled", err)
+		dbg.Printf("Warning: no config.json: %v", err)
 		chartCfg = nil
 	}
 
+	// 5. Init GPU/CPU samplers
 	statsQuery, err := newGpuPdhQuery()
 	if err != nil {
-		log.Fatalf("Error: %v", err)
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
 	}
 	defer statsQuery.close()
 
 	cpuSampler, err := newCpuUsageSampler()
 	if err != nil {
-		log.Fatalf("Error: %v", err)
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
 	}
 
-	// Initialise charts from config
-	var cpuChart *Chart
+	// 6. Get first stats snapshot (needed for RAM/VRAM labels)
+	stats, err := statsQuery.snapshot()
+	if err != nil {
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
+	}
+	memory, err := readSystemMemoryStats()
+	if err != nil {
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
+	}
+
+	// 7. Init charts
+	var charts [4]*Chart // cpu, ram, gpu, vram
 	if chartCfg != nil {
-		if gCfg, ok := chartCfg.Graphs["cpu"]; ok {
-			cpuChart = newChart(gCfg, chartCfg.DotSize, chartCfg.Thresholds)
-			fmt.Printf("  CPU chart: %dx%d at (%d,%d), capacity=%d dots\n",
-				gCfg.Width, gCfg.Height, gCfg.X, gCfg.Y, cpuChart.capacity)
+		names := [4]string{"cpu", "ram", "gpu", "vram"}
+		for i, name := range names {
+			if gCfg, ok := chartCfg.Graphs[name]; ok {
+				charts[i] = newChart(gCfg, chartCfg.DotSize, chartCfg.Thresholds, true) // noLines=true
+				dbg.Printf("%s chart: %dx%d at (%d,%d), capacity=%d",
+					name, gCfg.Width, gCfg.Height, gCfg.X, gCfg.Y, charts[i].capacity)
+			}
 		}
 	}
 
-	// Draw the base frame
-	base := renderTextImage(320, 480, "")
-	draw.Draw(base, image.Rect(20, 36, 20+60, 36+16), &image.Uniform{color.White}, image.Point{}, draw.Src)
-	helloDrawer := &font.Drawer{
-		Dst:  base,
-		Src:  image.NewUniform(color.Black),
-		Face: basicfont.Face7x13,
+	// 8. Draw base frame (white + dividers + labels)
+	labels := [4]string{
+		"CPU",
+		fmt.Sprintf("RAM - %s", formatBytesGiB(memory.totalBytes)),
+		"GPU",
+		fmt.Sprintf("VRAM - %s", formatBytesGiB(stats.totalBytes)),
 	}
-	helloDrawer.Dot = fixed.P(20, 48)
-	helloDrawer.DrawString("hello")
-	if err := sendDisplayBitmapRevA(handle, 0, 0, 319, 479, base); err != nil {
-		log.Fatalf("Error: %v", err)
+	base := renderBaseFrame(labels)
+	if err := sendDisplayBitmapRevA(handle, 0, 0, screenWidth-1, screenHeight-1, base); err != nil {
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
 	}
-	fmt.Println("  Sent the base frame.")
+	dbg.Printf("Base frame sent.")
 
-	// Text label positions
-	statsX, statsY := 20, 80
-	statsW, statsH := 180, 16
-	utilX, utilY := 20, 98
-	utilW, utilH := 100, 16
-	ramX, ramY := 20, 128
-	ramW, ramH := 220, 16
-	cpuX, cpuY := 20, 146
-	cpuW, cpuH := 100, 16
-
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	// 9. Signal handling
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
 
+	// 10. Update function
 	updateStats := func() error {
 		stats, err := statsQuery.snapshot()
 		if err != nil {
@@ -177,50 +192,126 @@ func main() {
 			return err
 		}
 
-		line1 := fmt.Sprintf("VRAM %s / %s", formatBytesGiB(stats.usedBytes), formatBytesGiB(stats.totalBytes))
-		line2 := fmt.Sprintf("3D %.0f%%", stats.utilPct)
-		line3 := fmt.Sprintf("RAM %.0f%% %s / %s", memory.loadPct, formatBytesGiB(memory.usedBytes), formatBytesGiB(memory.totalBytes))
-		line4 := fmt.Sprintf("CPU %.0f%%", cpuPct)
-
-		if err := sendDisplayBitmapRevA(handle, statsX, statsY, statsX+statsW-1, statsY+statsH-1, renderTextBox(statsW, statsH, line1)); err != nil {
-			return err
-		}
-		if err := sendDisplayBitmapRevA(handle, utilX, utilY, utilX+utilW-1, utilY+utilH-1, renderTextBox(utilW, utilH, line2)); err != nil {
-			return err
-		}
-		if err := sendDisplayBitmapRevA(handle, ramX, ramY, ramX+ramW-1, ramY+ramH-1, renderTextBox(ramW, ramH, line3)); err != nil {
-			return err
-		}
-		if err := sendDisplayBitmapRevA(handle, cpuX, cpuY, cpuX+cpuW-1, cpuY+cpuH-1, renderTextBox(cpuW, cpuH, line4)); err != nil {
-			return err
+		ramPct := memory.loadPct
+		gpuPct := stats.utilPct
+		var vramPct float64
+		if stats.totalBytes > 0 {
+			vramPct = float64(stats.usedBytes) * 100 / float64(stats.totalBytes)
 		}
 
-		// Update chart overlays
-		if cpuChart != nil {
-			for _, r := range cpuChart.update(cpuPct) {
+		// Update each chart and send dirty regions.
+		for i, ch := range charts {
+			if ch == nil {
+				continue
+			}
+			var value float64
+			switch i {
+			case 0:
+				value = cpuPct
+			case 1:
+				value = ramPct
+			case 2:
+				value = gpuPct
+			case 3:
+				value = vramPct
+			}
+			for _, r := range ch.update(value) {
 				if err := sendDisplayBitmapRevA(handle, r.X, r.Y,
 					r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
 					return err
 				}
 			}
 		}
+
+		dbg.Printf("Refreshed: CPU=%.0f%% RAM=%.0f%% GPU=%.0f%% VRAM=%.0f%%",
+			cpuPct, ramPct, gpuPct, vramPct)
 		return nil
 	}
 
+	// Initial update
 	if err := updateStats(); err != nil {
-		log.Fatalf("Error: %v", err)
+		dbg.Printf("Error: %v", err)
+		os.Exit(1)
 	}
+	dbg.Printf("Running... (Ctrl+C to stop)")
+
+	// 11. Main loop
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-interrupt:
-			fmt.Println("Stopped.")
+			dbg.Printf("Stopped.")
+			return
+		case <-exitApp:
+			dbg.Printf("Exit via tray menu.")
 			return
 		case <-ticker.C:
 			if err := updateStats(); err != nil {
-				log.Fatalf("Error: %v", err)
+				dbg.Printf("Error: %v", err)
+				os.Exit(1)
 			}
-			fmt.Printf("  GPU VRAM + 3D, RAM + CPU refreshed\r")
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Base frame — white canvas with 4 dividers and labels
+//
+// Each section (120px):
+//   row 0:        gray divider line
+//   rows 1..13:   label zone (white bg, centered text)
+//   rows 14..119: chart area (106px)
+// ---------------------------------------------------------------------------
+
+func renderBaseFrame(labels [4]string) *image.RGBA {
+	white := color.RGBA{255, 255, 255, 255}
+	gray := color.RGBA{divColor, divColor, divColor, 255}
+
+	img := image.NewRGBA(image.Rect(0, 0, screenWidth, screenHeight))
+	draw.Draw(img, img.Bounds(), &image.Uniform{white}, image.Point{}, draw.Src)
+
+	face := basicfont.Face7x13
+	metrics := face.Metrics()
+
+	for i, label := range labels {
+		start := sectionStart[i]
+
+		// Gray divider line at top of section.
+		for x := 0; x < screenWidth; x++ {
+			img.Set(x, start, gray)
+		}
+
+		// Label zone: rows start+1 .. start+labelZoneHeight
+		labelTop := start + 1
+
+		// Measure text.
+		textWidth := font.MeasureString(face, label).Ceil()
+		padding := 4
+		rectW := textWidth + padding
+		rectX := (screenWidth - rectW) / 2
+
+		// Center text vertically in label zone using correct baseline math.
+		// Text occupies: baseline-ascent .. baseline+descent (total = ascent+descent).
+		textH := metrics.Ascent.Ceil() + metrics.Descent.Ceil() // 13
+		textTop := labelTop + (labelZoneHeight-textH)/2         // 1+(15-13)/2 = 2
+		baseline := textTop + metrics.Ascent.Ceil()             // 2+11 = 13
+		textBot := baseline + metrics.Descent.Ceil()            // 13+2 = 15
+
+		// White background covering the full text extent.
+		draw.Draw(img, image.Rect(rectX, textTop, rectX+rectW, textBot+1),
+			&image.Uniform{white}, image.Point{}, draw.Src)
+
+		// Draw label text.
+		d := &font.Drawer{
+			Dst:  img,
+			Src:  image.NewUniform(color.RGBA{0, 0, 0, 255}),
+			Face: face,
+		}
+		d.Dot = fixed.P(rectX+padding/2, baseline)
+		d.DrawString(label)
+	}
+
+	return img
 }

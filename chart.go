@@ -39,7 +39,7 @@ type ThresholdConfig struct {
 }
 
 // ---------------------------------------------------------------------------
-// DirtyRegion — a small rectangular patch sent to the display.
+// DirtyRegion — a rectangular patch sent to the display.
 // ---------------------------------------------------------------------------
 
 type DirtyRegion struct {
@@ -60,8 +60,9 @@ type Chart struct {
 	history    []float64
 	filled     bool
 	prevColors []color.RGBA
-	prevValues []float64  // previous values for Y-position of each column
-	linesDrawn bool       // bounding lines drawn once on first update
+	prevValues []float64
+	linesDrawn bool
+	noLines    bool // when true, never draw bounding lines; use full height for dots
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +85,7 @@ func loadConfig(path string) (*ChartConfig, error) {
 // Constructor
 // ---------------------------------------------------------------------------
 
-func newChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig) *Chart {
+func newChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig, noLines bool) *Chart {
 	capacity := cfg.Width / dotSize
 	if capacity <= 0 {
 		capacity = 1
@@ -101,11 +102,12 @@ func newChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig) *Chart {
 		history:    make([]float64, 0, capacity),
 		prevColors: prevColors,
 		prevValues: make([]float64, capacity),
+		noLines:    noLines,
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Update — append a value, diff against previous frame, return dirty regions.
+// Update — append a value, diff, batch into blocks, return dirty regions.
 // value is a percentage 0..100.
 // ---------------------------------------------------------------------------
 
@@ -118,7 +120,6 @@ func (c *Chart) update(value float64) []*DirtyRegion {
 	}
 
 	currColors, currValues := c.renderFrame(value)
-	dirty := c.diff(c.prevColors, currColors, c.prevValues, currValues)
 
 	if !c.filled {
 		c.history = append(c.history, value)
@@ -133,63 +134,23 @@ func (c *Chart) update(value float64) []*DirtyRegion {
 	copy(c.prevColors, currColors)
 	copy(c.prevValues, currValues)
 
-	// Draw bounding lines once on first update.
+	// DEBUG: send entire graph as one block every time.
+	drawLines := !c.noLines && !c.linesDrawn
+	dirty := []*DirtyRegion{c.renderFullBlock(currColors, currValues, drawLines)}
+
 	if !c.linesDrawn {
 		c.linesDrawn = true
-		dirty = append(dirty, c.drawBoundingLines()...)
 	}
 
 	return dirty
 }
 
 // ---------------------------------------------------------------------------
-// renderFrame — colour + value of every dot column for the current state.
-// Does not mutate history. Returns colours and values in parallel slices.
+// markChanged — returns a bool slice: true for columns that changed.
 // ---------------------------------------------------------------------------
 
-func (c *Chart) renderFrame(value float64) ([]color.RGBA, []float64) {
-	colors := make([]color.RGBA, c.capacity)
-	values := make([]float64, c.capacity)
-	for i := range colors {
-		colors[i] = color.RGBA{255, 255, 255, 255} // white background
-		values[i] = 0
-	}
-
-	// Build the full history including the new value.
-	var dots []float64
-	if !c.filled {
-		dots = append(append([]float64(nil), c.history...), value)
-	} else {
-		dots = make([]float64, c.capacity)
-		copy(dots, c.history[1:])
-		dots[c.capacity-1] = value
-	}
-
-	// Always render from the right edge. The "camera" starts at the right
-	// and slides left as more data accumulates. This means the transition
-	// from fill→shift is seamless — dots always push left.
-	n := len(dots)
-	for i := 0; i < n && i < c.capacity; i++ {
-		col := c.capacity - n + i // right-aligned
-		colors[col] = c.dotColor(dots[i])
-		values[col] = dots[i]
-	}
-	return colors, values
-}
-
-// ---------------------------------------------------------------------------
-// diff — compare prev/curr colour+value arrays, return DirtyRegion for changes.
-//
-// For each column:
-//   prev white → curr colored : draw colored dot at new Y
-//   prev colored → curr white : white-out at OLD Y (clear ghost dot)
-//   prev colored → curr colored, different : white-out old Y, draw new color
-//   prev colored → curr colored, same : skip
-//   prev white → curr white : skip
-// ---------------------------------------------------------------------------
-
-func (c *Chart) diff(prevColors, currColors []color.RGBA, prevValues, currValues []float64) []*DirtyRegion {
-	var regions []*DirtyRegion
+func (c *Chart) markChanged(prevColors, currColors []color.RGBA, prevValues, currValues []float64) []bool {
+	changed := make([]bool, c.capacity)
 	white := color.RGBA{255, 255, 255, 255}
 
 	n := len(currColors)
@@ -207,20 +168,79 @@ func (c *Chart) diff(prevColors, currColors []color.RGBA, prevValues, currValues
 		if !wasDot && !isDot {
 			continue
 		}
-
 		if wasDot && !isDot {
-			regions = append(regions, c.dotRegion(i, white, prevValues[i]))
+			changed[i] = true
 			continue
 		}
-
 		if !wasDot && isDot {
-			regions = append(regions, c.dotRegion(i, currColors[i], currValues[i]))
+			changed[i] = true
 			continue
 		}
-
 		if prevColors[i] != currColors[i] || prevValues[i] != currValues[i] {
-			regions = append(regions, c.dotRegion(i, white, prevValues[i]))
-			regions = append(regions, c.dotRegion(i, currColors[i], currValues[i]))
+			changed[i] = true
+		}
+	}
+	return changed
+}
+
+// ---------------------------------------------------------------------------
+// batchBlocks — group contiguous changed columns into block bitmaps.
+//
+// Each block spans the full graph height. Only columns that changed are
+// included; white columns are skipped entirely (no block created).
+//
+// Contiguous changed columns are merged into one block to minimise serial
+// transfers. Non-contiguous changed columns become separate blocks.
+// ---------------------------------------------------------------------------
+
+func (c *Chart) batchBlocks(changed []bool, colors []color.RGBA, values []float64) []*DirtyRegion {
+	var regions []*DirtyRegion
+	white := color.RGBA{255, 255, 255, 255}
+
+	// Walk columns, grouping contiguous changed ones.
+	runStart := -1
+	for i := 0; i < c.capacity; i++ {
+		if !changed[i] {
+			continue
+		}
+		if runStart == -1 {
+			runStart = i
+		}
+
+		// Check if next column is also changed — if not, emit block.
+		if i+1 >= c.capacity || !changed[i+1] {
+			// Build bitmap for columns [runStart .. i].
+			blockWidth := (i - runStart + 1) * c.dotSize
+			img := image.NewRGBA(image.Rect(0, 0, blockWidth, c.cfg.Height))
+			// Fill with white background.
+			for y := 0; y < c.cfg.Height; y++ {
+				for x := 0; x < blockWidth; x++ {
+					img.Set(x, y, white)
+				}
+			}
+			// Draw dots.
+			for col := runStart; col <= i; col++ {
+				clr := colors[col]
+				if clr == white {
+					continue // white-out: already white in background
+				}
+				dotX := (col - runStart) * c.dotSize
+				dotY := c.valueToY(values[col])
+				for dy := 0; dy < c.dotSize; dy++ {
+					for dx := 0; dx < c.dotSize; dx++ {
+						py := dotY + dy
+						if py >= 0 && py < c.cfg.Height {
+							img.Set(dotX+dx, py, clr)
+						}
+					}
+				}
+			}
+			regions = append(regions, &DirtyRegion{
+				X:     c.cfg.X + runStart*c.dotSize,
+				Y:     c.cfg.Y,
+				Image: img,
+			})
+			runStart = -1
 		}
 	}
 
@@ -228,15 +248,111 @@ func (c *Chart) diff(prevColors, currColors []color.RGBA, prevValues, currValues
 }
 
 // ---------------------------------------------------------------------------
+// renderFrame — colour + value of every dot column for the current state.
+// Does not mutate history. Returns colours and values in parallel slices.
+// ---------------------------------------------------------------------------
+
+func (c *Chart) renderFrame(value float64) ([]color.RGBA, []float64) {
+	colors := make([]color.RGBA, c.capacity)
+	values := make([]float64, c.capacity)
+	for i := range colors {
+		colors[i] = color.RGBA{255, 255, 255, 255}
+		values[i] = 0
+	}
+
+	var dots []float64
+	if !c.filled {
+		dots = append(append([]float64(nil), c.history...), value)
+	} else {
+		dots = make([]float64, c.capacity)
+		copy(dots, c.history[1:])
+		dots[c.capacity-1] = value
+	}
+
+	// Always render from the right edge.
+	n := len(dots)
+	for i := 0; i < n && i < c.capacity; i++ {
+		col := c.capacity - n + i
+		colors[col] = c.dotColor(dots[i])
+		values[col] = dots[i]
+	}
+	return colors, values
+}
+
+// ---------------------------------------------------------------------------
+// renderFullBlock — render entire graph area as one block (DEBUG).
+// ---------------------------------------------------------------------------
+
+func (c *Chart) renderFullBlock(colors []color.RGBA, values []float64, drawLines bool) *DirtyRegion {
+	white := color.RGBA{255, 255, 255, 255}
+	lineColor := color.RGBA{128, 128, 128, 255}
+
+	var blockTop, blockHeight int
+	if c.noLines {
+		// No bounding lines — use full height for dots.
+		blockTop = 0
+		blockHeight = c.cfg.Height
+	} else {
+		blockTop = 0
+		blockBot := c.cfg.Height - 1
+		if !drawLines {
+			blockTop = 1
+			blockBot = c.cfg.Height - 2
+		}
+		blockHeight = blockBot - blockTop + 1
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, c.cfg.Width, blockHeight))
+
+	// Fill white.
+	for y := 0; y < blockHeight; y++ {
+		for x := 0; x < c.cfg.Width; x++ {
+			img.Set(x, y, white)
+		}
+	}
+
+	// Bounding lines (only on first update, and only when not noLines).
+	if drawLines && !c.noLines {
+		for x := 0; x < c.cfg.Width; x++ {
+			img.Set(x, 0, lineColor)            // top line at row 0
+			img.Set(x, blockHeight-1, lineColor) // bottom line at row height-1
+		}
+	}
+
+	// Dots.
+	yOffset := blockTop
+	for col := 0; col < c.capacity; col++ {
+		if colors[col] == white {
+			continue
+		}
+		clr := colors[col]
+		dotX := col * c.dotSize
+		dotY := c.valueToY(values[col]) - yOffset
+		for dy := 0; dy < c.dotSize; dy++ {
+			for dx := 0; dx < c.dotSize; dx++ {
+				py := dotY + dy
+				px := dotX + dx
+				if py >= 0 && py < blockHeight && px >= 0 && px < c.cfg.Width {
+					img.Set(px, py, clr)
+				}
+			}
+		}
+	}
+
+	return &DirtyRegion{
+		X:     c.cfg.X,
+		Y:     c.cfg.Y + blockTop,
+		Image: img,
+	}
+}
+
 // drawBoundingLines — top (100%) and bottom (0%) lines, 1px high each.
-// Returns dirty regions to draw them on the white background.
 // ---------------------------------------------------------------------------
 
 func (c *Chart) drawBoundingLines() []*DirtyRegion {
-	lineColor := color.RGBA{128, 128, 128, 255} // grey
+	lineColor := color.RGBA{128, 128, 128, 255}
 	regions := make([]*DirtyRegion, 0, 2)
 
-	// Top line at y=0 (100% boundary) — drawn as a 1px high strip.
 	topImg := image.NewRGBA(image.Rect(0, 0, c.cfg.Width, 1))
 	for x := 0; x < c.cfg.Width; x++ {
 		topImg.Set(x, 0, lineColor)
@@ -247,7 +363,6 @@ func (c *Chart) drawBoundingLines() []*DirtyRegion {
 		Image: topImg,
 	})
 
-	// Bottom line at y=height-1 (0% boundary).
 	bottomImg := image.NewRGBA(image.Rect(0, 0, c.cfg.Width, 1))
 	for x := 0; x < c.cfg.Width; x++ {
 		bottomImg.Set(x, 0, lineColor)
@@ -262,49 +377,28 @@ func (c *Chart) drawBoundingLines() []*DirtyRegion {
 }
 
 // ---------------------------------------------------------------------------
-// dotRegion — build a DirtyRegion for one dot at the correct screen position.
-// ---------------------------------------------------------------------------
-
-func (c *Chart) dotRegion(col int, clr color.RGBA, value float64) *DirtyRegion {
-	return &DirtyRegion{
-		X:     c.cfg.X + col*c.dotSize,
-		Y:     c.cfg.Y + c.valueToY(value),
-		Image: c.makeDotImage(clr),
-	}
-}
-
-// ---------------------------------------------------------------------------
-// valueToY — map percentage to pixel offset within the graph area.
-//
-// The graph area is [0 .. height-1]. Top and bottom rows are reserved for
-// bounding lines, so dots occupy [1 .. height-2].
-//   0%   → height-2  (just above bottom line)
-//  100%  → 1         (just below top line)
+// valueToY — maps percentage to Y pixel position.
+// With lines: 0% → height-2, 100% → 1 (bounding lines at 0 and height-1).
+// No lines: 0% → height-1, 100% → 0 (full height available).
 // ---------------------------------------------------------------------------
 
 func (c *Chart) valueToY(value float64) int {
-	// Usable range: 1 .. height-2  (height-2 rows)
-	usable := c.cfg.Height - 2
-	if usable <= 0 {
-		usable = 1
-	}
-	// Normalise to 0..1, map to [0 .. usable-1], then offset by 1.
-	pixel := int((value / 100.0) * float64(usable-1))
-	return 1 + (usable - 1 - pixel)
-}
-
-// ---------------------------------------------------------------------------
-// makeDotImage — dotSize×dotSize solid-colour image.
-// ---------------------------------------------------------------------------
-
-func (c *Chart) makeDotImage(clr color.RGBA) *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, c.dotSize, c.dotSize))
-	for y := 0; y < c.dotSize; y++ {
-		for x := 0; x < c.dotSize; x++ {
-			img.Set(x, y, clr)
+	if c.noLines {
+		// Dot top-left must fit in [0, height-dotSize] so the full dot is visible.
+		maxDotY := c.cfg.Height - c.dotSize
+		if maxDotY < 0 {
+			maxDotY = 0
 		}
+		// 100% → row 0, 0% → row maxDotY
+		return int((1.0 - value/100.0) * float64(maxDotY))
 	}
-	return img
+	// With lines: dot must fit between row 1 and row height-2.
+	maxDotY := c.cfg.Height - c.dotSize - 1
+	if maxDotY < 1 {
+		maxDotY = 1
+	}
+	// 100% → row 1, 0% → row maxDotY
+	return 1 + int((1.0 - value/100.0) * float64(maxDotY-1))
 }
 
 // ---------------------------------------------------------------------------
