@@ -1,7 +1,7 @@
 //go:build windows
 
 // Windows API wrappers: serial port, GPU PDH, DXGI, system memory, CPU usage.
-package main
+package displayapp
 
 import (
 	"encoding/binary"
@@ -543,9 +543,9 @@ func (q *gpuPdhQuery) formattedArray(counter windows.Handle, format uint32) ([]p
 
 	items := make([]pdhFmtCounterValueItem, 0, itemCount)
 	itemSize := unsafe.Sizeof(pdhFmtCounterValueItem{})
-	base := uintptr(unsafe.Pointer(&buf[0]))
+	base := unsafe.Pointer(&buf[0])
 	for i := uint32(0); i < itemCount; i++ {
-		item := (*pdhFmtCounterValueItem)(unsafe.Pointer(base + uintptr(i)*itemSize))
+		item := (*pdhFmtCounterValueItem)(unsafe.Add(base, uintptr(i)*itemSize))
 		items = append(items, *item)
 	}
 	return items, nil

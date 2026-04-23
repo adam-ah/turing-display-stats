@@ -1,22 +1,44 @@
 // Chart rendering for Turing Smart Screen.
 // Pure logic — no Windows APIs — so it can be unit-tested anywhere.
-package main
+package displayapp
 
 import (
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"os"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
 // JSON config types
 // ---------------------------------------------------------------------------
 
+// RGBA is a JSON-friendly wrapper around color.RGBA that accepts "#RRGGBB" strings.
+type RGBA struct {
+	color.RGBA
+}
+
+func (c *RGBA) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	var r, g, b uint64
+	if _, err := fmt.Sscanf(s, "#%02x%02x%02x", &r, &g, &b); err != nil {
+		return fmt.Errorf("invalid color %q: %v", s, err)
+	}
+	c.R, c.G, c.B, c.A = uint8(r), uint8(g), uint8(b), 255
+	return nil
+}
+
 type ChartConfig struct {
-	Screen     ScreenConfig       `json:"screen"`
-	DotSize    int                `json:"dot_size"`
-	Thresholds ThresholdConfig    `json:"thresholds"`
+	Screen     ScreenConfig           `json:"screen"`
+	DotSize    int                    `json:"dot_size"`
+	FontSize   int                    `json:"font_size"`
+	Thresholds ThresholdConfig        `json:"thresholds"`
+	Colors     ColorConfig            `json:"colors"`
 	Graphs     map[string]GraphConfig `json:"graphs"`
 }
 
@@ -26,16 +48,58 @@ type ScreenConfig struct {
 }
 
 type GraphConfig struct {
-	X      int `json:"x"`
-	Y      int `json:"y"`
-	Width  int `json:"width"`
-	Height int `json:"height"`
+	X          int `json:"x"`
+	Y          int `json:"y"`
+	Width      int `json:"width"`
+	Height     int `json:"height"`
+	RefreshSec int `json:"refresh_sec"` // whole seconds between fresh samples; 0 = use default 1s
+}
+
+func (g *GraphConfig) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		X          int  `json:"x"`
+		Y          int  `json:"y"`
+		Width      int  `json:"width"`
+		Height     int  `json:"height"`
+		RefreshSec *int `json:"refresh_sec"`
+		RefreshMs  *int `json:"refresh_ms"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	g.X = raw.X
+	g.Y = raw.Y
+	g.Width = raw.Width
+	g.Height = raw.Height
+
+	switch {
+	case raw.RefreshSec != nil:
+		g.RefreshSec = *raw.RefreshSec
+	case raw.RefreshMs != nil:
+		g.RefreshSec = (*raw.RefreshMs + 999) / 1000
+	default:
+		g.RefreshSec = 0
+	}
+
+	return nil
 }
 
 type ThresholdConfig struct {
 	Green  float64 `json:"green"`
 	Yellow float64 `json:"yellow"`
 	Red    float64 `json:"red"`
+}
+
+type ColorConfig struct {
+	Green      RGBA `json:"green"`       // dot colour for green tier
+	Yellow     RGBA `json:"yellow"`      // dot colour for yellow tier
+	Red        RGBA `json:"red"`         // dot colour for red tier
+	GreenFill  RGBA `json:"green_fill"`  // pastel fill below green dots
+	YellowFill RGBA `json:"yellow_fill"` // pastel fill below yellow dots
+	RedFill    RGBA `json:"red_fill"`    // pastel fill below red dots
+	Background RGBA `json:"background"`  // chart background colour
+	FontColor  RGBA `json:"font_color"`  // label text colour
 }
 
 // ---------------------------------------------------------------------------
@@ -55,8 +119,10 @@ type DirtyRegion struct {
 type Chart struct {
 	cfg        GraphConfig
 	dotSize    int
+	bg         color.RGBA
 	capacity   int
 	thresholds ThresholdConfig
+	colors     ColorConfig
 	history    []float64
 	filled     bool
 	prevColors []color.RGBA
@@ -85,20 +151,23 @@ func loadConfig(path string) (*ChartConfig, error) {
 // Constructor
 // ---------------------------------------------------------------------------
 
-func newChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig, noLines bool) *Chart {
+func newChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig, cc ColorConfig, bg color.RGBA, refreshSec int, noLines bool) *Chart {
+	_ = refreshSec // cadence is enforced by the sampling cache, not the chart renderer.
 	capacity := cfg.Width / dotSize
 	if capacity <= 0 {
 		capacity = 1
 	}
 	prevColors := make([]color.RGBA, capacity)
 	for i := range prevColors {
-		prevColors[i] = color.RGBA{255, 255, 255, 255}
+		prevColors[i] = bg
 	}
 	return &Chart{
 		cfg:        cfg,
 		dotSize:    dotSize,
+		bg:         bg,
 		capacity:   capacity,
 		thresholds: thresholds,
+		colors:     cc,
 		history:    make([]float64, 0, capacity),
 		prevColors: prevColors,
 		prevValues: make([]float64, capacity),
@@ -107,11 +176,21 @@ func newChart(cfg GraphConfig, dotSize int, thresholds ThresholdConfig, noLines 
 }
 
 // ---------------------------------------------------------------------------
-// Update — append a value, diff, batch into blocks, return dirty regions.
+// Update — append one value, diff, batch into blocks, return dirty regions.
 // value is a percentage 0..100.
 // ---------------------------------------------------------------------------
 
-func (c *Chart) update(value float64) []*DirtyRegion {
+func (c *Chart) update(value float64, now time.Time) []*DirtyRegion {
+	return c.updateRepeated(value, 1)
+}
+
+// updateRepeated appends the same value multiple times before rendering.
+// This is used for slower charts so they advance by several identical dots at
+// once instead of redrawing every second.
+func (c *Chart) updateRepeated(value float64, repeats int) []*DirtyRegion {
+	if repeats <= 0 {
+		return nil
+	}
 	if value < 0 {
 		value = 0
 	}
@@ -119,17 +198,30 @@ func (c *Chart) update(value float64) []*DirtyRegion {
 		value = 100
 	}
 
-	currColors, currValues := c.renderFrame(value)
-
-	if !c.filled {
-		c.history = append(c.history, value)
-		if len(c.history) >= c.capacity {
-			c.filled = true
+	if c.filled {
+		if repeats >= c.capacity {
+			for i := range c.history {
+				c.history[i] = value
+			}
+		} else {
+			copy(c.history, c.history[repeats:])
+			for i := c.capacity - repeats; i < c.capacity; i++ {
+				c.history[i] = value
+			}
 		}
 	} else {
-		copy(c.history, c.history[1:])
-		c.history[c.capacity-1] = value
+		for i := 0; i < repeats; i++ {
+			c.history = append(c.history, value)
+		}
+		if len(c.history) >= c.capacity {
+			if len(c.history) > c.capacity {
+				c.history = c.history[len(c.history)-c.capacity:]
+			}
+			c.filled = true
+		}
 	}
+
+	currColors, currValues := c.renderFrame()
 
 	copy(c.prevColors, currColors)
 	copy(c.prevValues, currValues)
@@ -151,7 +243,7 @@ func (c *Chart) update(value float64) []*DirtyRegion {
 
 func (c *Chart) markChanged(prevColors, currColors []color.RGBA, prevValues, currValues []float64) []bool {
 	changed := make([]bool, c.capacity)
-	white := color.RGBA{255, 255, 255, 255}
+	bg := c.bg
 
 	n := len(currColors)
 	if len(prevColors) < n {
@@ -162,8 +254,8 @@ func (c *Chart) markChanged(prevColors, currColors []color.RGBA, prevValues, cur
 	}
 
 	for i := 0; i < n; i++ {
-		wasDot := prevColors[i] != white
-		isDot := currColors[i] != white
+		wasDot := prevColors[i] != bg
+		isDot := currColors[i] != bg
 
 		if !wasDot && !isDot {
 			continue
@@ -195,7 +287,7 @@ func (c *Chart) markChanged(prevColors, currColors []color.RGBA, prevValues, cur
 
 func (c *Chart) batchBlocks(changed []bool, colors []color.RGBA, values []float64) []*DirtyRegion {
 	var regions []*DirtyRegion
-	white := color.RGBA{255, 255, 255, 255}
+	bg := c.bg
 
 	// Walk columns, grouping contiguous changed ones.
 	runStart := -1
@@ -212,20 +304,30 @@ func (c *Chart) batchBlocks(changed []bool, colors []color.RGBA, values []float6
 			// Build bitmap for columns [runStart .. i].
 			blockWidth := (i - runStart + 1) * c.dotSize
 			img := image.NewRGBA(image.Rect(0, 0, blockWidth, c.cfg.Height))
-			// Fill with white background.
+			// Fill with background.
 			for y := 0; y < c.cfg.Height; y++ {
 				for x := 0; x < blockWidth; x++ {
-					img.Set(x, y, white)
+					img.Set(x, y, bg)
 				}
 			}
-			// Draw dots.
+			// Draw dots + fill.
 			for col := runStart; col <= i; col++ {
 				clr := colors[col]
-				if clr == white {
+				if clr == bg {
 					continue // white-out: already white in background
 				}
+				fillClr := c.dotFillColor(values[col])
 				dotX := (col - runStart) * c.dotSize
 				dotY := c.valueToY(values[col])
+
+				// Fill the gap below the dot with pastel colour.
+				for fy := dotY + c.dotSize; fy < c.cfg.Height; fy++ {
+					for dx := 0; dx < c.dotSize; dx++ {
+						img.Set(dotX+dx, fy, fillClr)
+					}
+				}
+
+				// Draw the dot.
 				for dy := 0; dy < c.dotSize; dy++ {
 					for dx := 0; dx < c.dotSize; dx++ {
 						py := dotY + dy
@@ -252,22 +354,15 @@ func (c *Chart) batchBlocks(changed []bool, colors []color.RGBA, values []float6
 // Does not mutate history. Returns colours and values in parallel slices.
 // ---------------------------------------------------------------------------
 
-func (c *Chart) renderFrame(value float64) ([]color.RGBA, []float64) {
+func (c *Chart) renderFrame() ([]color.RGBA, []float64) {
 	colors := make([]color.RGBA, c.capacity)
 	values := make([]float64, c.capacity)
 	for i := range colors {
-		colors[i] = color.RGBA{255, 255, 255, 255}
+		colors[i] = c.bg
 		values[i] = 0
 	}
 
-	var dots []float64
-	if !c.filled {
-		dots = append(append([]float64(nil), c.history...), value)
-	} else {
-		dots = make([]float64, c.capacity)
-		copy(dots, c.history[1:])
-		dots[c.capacity-1] = value
-	}
+	dots := c.history
 
 	// Always render from the right edge.
 	n := len(dots)
@@ -284,7 +379,7 @@ func (c *Chart) renderFrame(value float64) ([]color.RGBA, []float64) {
 // ---------------------------------------------------------------------------
 
 func (c *Chart) renderFullBlock(colors []color.RGBA, values []float64, drawLines bool) *DirtyRegion {
-	white := color.RGBA{255, 255, 255, 255}
+	bg := c.bg
 	lineColor := color.RGBA{128, 128, 128, 255}
 
 	var blockTop, blockHeight int
@@ -304,30 +399,48 @@ func (c *Chart) renderFullBlock(colors []color.RGBA, values []float64, drawLines
 
 	img := image.NewRGBA(image.Rect(0, 0, c.cfg.Width, blockHeight))
 
-	// Fill white.
+	// Fill background.
 	for y := 0; y < blockHeight; y++ {
 		for x := 0; x < c.cfg.Width; x++ {
-			img.Set(x, y, white)
+			img.Set(x, y, bg)
 		}
 	}
 
 	// Bounding lines (only on first update, and only when not noLines).
 	if drawLines && !c.noLines {
 		for x := 0; x < c.cfg.Width; x++ {
-			img.Set(x, 0, lineColor)            // top line at row 0
+			img.Set(x, 0, lineColor)             // top line at row 0
 			img.Set(x, blockHeight-1, lineColor) // bottom line at row height-1
 		}
 	}
 
-	// Dots.
+	// Dots + fill.
 	yOffset := blockTop
 	for col := 0; col < c.capacity; col++ {
-		if colors[col] == white {
+		if colors[col] == bg {
 			continue
 		}
 		clr := colors[col]
+		fillClr := c.dotFillColor(values[col])
 		dotX := col * c.dotSize
 		dotY := c.valueToY(values[col]) - yOffset
+
+		// Fill the gap below the dot with pastel colour.
+		// Stop before bottom bounding line when lines are drawn.
+		fillBot := blockHeight
+		if drawLines && !c.noLines {
+			fillBot = blockHeight - 1
+		}
+		for fy := dotY + c.dotSize; fy < fillBot; fy++ {
+			for dx := 0; dx < c.dotSize; dx++ {
+				px := dotX + dx
+				if px >= 0 && px < c.cfg.Width {
+					img.Set(px, fy, fillClr)
+				}
+			}
+		}
+
+		// Draw the dot.
 		for dy := 0; dy < c.dotSize; dy++ {
 			for dx := 0; dx < c.dotSize; dx++ {
 				py := dotY + dy
@@ -398,7 +511,7 @@ func (c *Chart) valueToY(value float64) int {
 		maxDotY = 1
 	}
 	// 100% → row 1, 0% → row maxDotY
-	return 1 + int((1.0 - value/100.0) * float64(maxDotY-1))
+	return 1 + int((1.0-value/100.0)*float64(maxDotY-1))
 }
 
 // ---------------------------------------------------------------------------
@@ -408,10 +521,24 @@ func (c *Chart) valueToY(value float64) int {
 func (c *Chart) dotColor(value float64) color.RGBA {
 	switch {
 	case value >= c.thresholds.Red:
-		return color.RGBA{255, 0, 0, 255}
+		return c.colors.Red.RGBA
 	case value >= c.thresholds.Yellow:
-		return color.RGBA{255, 255, 0, 255}
+		return c.colors.Yellow.RGBA
 	default:
-		return color.RGBA{0, 255, 0, 255}
+		return c.colors.Green.RGBA
+	}
+}
+
+// dotFillColor — pick the pastel fill colour from thresholds.
+// ---------------------------------------------------------------------------
+
+func (c *Chart) dotFillColor(value float64) color.RGBA {
+	switch {
+	case value >= c.thresholds.Red:
+		return c.colors.RedFill.RGBA
+	case value >= c.thresholds.Yellow:
+		return c.colors.YellowFill.RGBA
+	default:
+		return c.colors.GreenFill.RGBA
 	}
 }

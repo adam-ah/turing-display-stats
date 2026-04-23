@@ -1,10 +1,12 @@
-package main
+package displayapp
 
 import (
+	"image"
 	"image/color"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -57,13 +59,38 @@ func TestLoadConfigBadJSON(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRefreshSecondsCompat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	_ = os.WriteFile(path, []byte(`{
+		"screen": {"width": 480, "height": 320},
+		"dot_size": 5,
+		"thresholds": {"green": 0, "yellow": 40, "red": 70},
+		"graphs": {
+			"cpu": {"x": 0, "y": 0, "width": 100, "height": 50, "refresh_ms": 1500},
+			"ram": {"x": 0, "y": 0, "width": 100, "height": 50, "refresh_sec": 2}
+		}
+	}`), 0644)
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.Graphs["cpu"].RefreshSec; got != 2 {
+		t.Fatalf("cpu refresh = %d, want 2", got)
+	}
+	if got := cfg.Graphs["ram"].RefreshSec; got != 2 {
+		t.Fatalf("ram refresh = %d, want 2", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // newChart
 // ---------------------------------------------------------------------------
 
 func TestNewChartCapacity(t *testing.T) {
 	cfg := GraphConfig{X: 10, Y: 20, Width: 100, Height: 50}
-	c := newChart(cfg, 5, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 5, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 	if c.capacity != 20 {
 		t.Errorf("capacity = %d, want 20", c.capacity)
 	}
@@ -80,7 +107,7 @@ func TestNewChartCapacity(t *testing.T) {
 
 func TestNewChartZeroWidth(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 0, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{}, false)
+	c := newChart(cfg, 4, ThresholdConfig{}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 	if c.capacity != 1 {
 		t.Errorf("capacity = %d, want 1 (minimum)", c.capacity)
 	}
@@ -88,7 +115,7 @@ func TestNewChartZeroWidth(t *testing.T) {
 
 func TestNewChartNoLines(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 100, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{}, true)
+	c := newChart(cfg, 4, ThresholdConfig{}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, true)
 	if !c.noLines {
 		t.Error("noLines should be true")
 	}
@@ -100,8 +127,13 @@ func TestNewChartNoLines(t *testing.T) {
 
 func TestDotColor(t *testing.T) {
 	thresh := ThresholdConfig{Green: 0, Yellow: 50, Red: 80}
+	cc := ColorConfig{
+		Green:  RGBA{color.RGBA{0, 255, 0, 255}},
+		Yellow: RGBA{color.RGBA{255, 255, 0, 255}},
+		Red:    RGBA{color.RGBA{255, 0, 0, 255}},
+	}
 	cfg := GraphConfig{Width: 20, Height: 10}
-	c := newChart(cfg, 4, thresh, false)
+	c := newChart(cfg, 4, thresh, cc, color.RGBA{255, 255, 255, 255}, 1000, false)
 
 	tests := []struct {
 		value float64
@@ -145,16 +177,16 @@ func colorName(clr color.RGBA) string {
 
 func TestValueToY(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 100, Height: 100}
-	c := newChart(cfg, 4, ThresholdConfig{}, false)
+	c := newChart(cfg, 4, ThresholdConfig{}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 
 	// With lines: dot top fits in [1, height-dotSize-1] = [1, 95]
 	tests := []struct {
 		value float64
 		want  int
 	}{
-		{0, 95},   // 0% → maxDotY (dot occupies 95..98, fits above bottom line at 98)
-		{100, 1},  // 100% → row 1 (dot occupies 1..4, fits below top line at 0)
-		{50, 48},  // 50% → middle
+		{0, 95},  // 0% → maxDotY (dot occupies 95..98, fits above bottom line at 98)
+		{100, 1}, // 100% → row 1 (dot occupies 1..4, fits below top line at 0)
+		{50, 48}, // 50% → middle
 	}
 	for _, tt := range tests {
 		got := c.valueToY(tt.value)
@@ -170,16 +202,16 @@ func TestValueToY(t *testing.T) {
 
 func TestValueToYNoLines(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 100, Height: 100}
-	c := newChart(cfg, 4, ThresholdConfig{}, true)
+	c := newChart(cfg, 4, ThresholdConfig{}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, true)
 
 	// No lines: dot top fits in [0, height-dotSize] = [0, 96]
 	tests := []struct {
 		value float64
 		want  int
 	}{
-		{0, 96},   // 0% → maxDotY (dot occupies 96..99, fits in height 100)
-		{100, 0},  // 100% → row 0 (dot occupies 0..3)
-		{50, 48},  // 50% → middle
+		{0, 96},  // 0% → maxDotY (dot occupies 96..99, fits in height 100)
+		{100, 0}, // 100% → row 0 (dot occupies 0..3)
+		{50, 48}, // 50% → middle
 	}
 	for _, tt := range tests {
 		got := c.valueToY(tt.value)
@@ -195,7 +227,7 @@ func TestValueToYNoLines(t *testing.T) {
 
 func TestDrawBoundingLines(t *testing.T) {
 	cfg := GraphConfig{X: 10, Y: 20, Width: 100, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{}, false)
+	c := newChart(cfg, 4, ThresholdConfig{}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 	regions := c.drawBoundingLines()
 	if len(regions) != 2 {
 		t.Fatalf("got %d regions, want 2", len(regions))
@@ -221,11 +253,17 @@ func TestDrawBoundingLines(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRenderFrame(t *testing.T) {
+	cc := ColorConfig{
+		Green:  RGBA{color.RGBA{0, 255, 0, 255}},
+		Yellow: RGBA{color.RGBA{255, 255, 0, 255}},
+		Red:    RGBA{color.RGBA{255, 0, 0, 255}},
+	}
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, cc, color.RGBA{255, 255, 255, 255}, 1000, false)
 
-	// Empty — one yellow dot at rightmost col (4)
-	colors, values := c.renderFrame(50)
+	// One yellow dot at rightmost col (4)
+	c.history = []float64{50}
+	colors, values := c.renderFrame()
 	if colorName(colors[4]) != "yellow" {
 		t.Errorf("col 4 = %s, want yellow", colorName(colors[4]))
 	}
@@ -238,9 +276,9 @@ func TestRenderFrame(t *testing.T) {
 		}
 	}
 
-	// Partially filled: history=[10, 60, 90], new=30 → cols 1..4
-	c.history = []float64{10, 60, 90}
-	colors, values = c.renderFrame(30)
+	// Partially filled: history=[10, 60, 90, 30] → cols 1..4
+	c.history = []float64{10, 60, 90, 30}
+	colors, values = c.renderFrame()
 	if colorName(colors[1]) != "green" {
 		t.Errorf("col 1 = %s, want green", colorName(colors[1]))
 	}
@@ -264,7 +302,7 @@ func TestRenderFrame(t *testing.T) {
 
 func TestMarkChanged(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{}, false)
+	c := newChart(cfg, 4, ThresholdConfig{}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 	white := color.RGBA{255, 255, 255, 255}
 
 	// col 0: same green, col 1: green→red, col 2: red→white, col 3: white→yellow, col 4: same
@@ -295,7 +333,7 @@ func TestMarkChanged(t *testing.T) {
 
 func TestBatchBlocksSingleDot(t *testing.T) {
 	cfg := GraphConfig{X: 10, Y: 20, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 	white := color.RGBA{255, 255, 255, 255}
 
 	changed := []bool{false, false, true, false, false}
@@ -328,7 +366,7 @@ func TestBatchBlocksSingleDot(t *testing.T) {
 
 func TestBatchBlocksContiguous(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 	white := color.RGBA{255, 255, 255, 255}
 
 	// cols 1,2,3 changed → one block
@@ -351,7 +389,7 @@ func TestBatchBlocksContiguous(t *testing.T) {
 
 func TestBatchBlocksNonContiguous(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 	white := color.RGBA{255, 255, 255, 255}
 
 	// cols 0,1 changed, col 2 white, cols 3,4 changed → 2 blocks
@@ -383,7 +421,7 @@ func TestBatchBlocksNonContiguous(t *testing.T) {
 
 func TestBatchBlocksWhiteOut(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{}, false)
+	c := newChart(cfg, 4, ThresholdConfig{}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 	white := color.RGBA{255, 255, 255, 255}
 
 	// col 0: green→white (white-out), col 1: white (unchanged)
@@ -404,7 +442,7 @@ func TestBatchBlocksWhiteOut(t *testing.T) {
 
 func TestRenderFullBlockWithLines(t *testing.T) {
 	cfg := GraphConfig{X: 10, Y: 20, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 
 	white := color.RGBA{255, 255, 255, 255}
 	colors := []color.RGBA{
@@ -441,7 +479,7 @@ func TestRenderFullBlockWithLines(t *testing.T) {
 
 func TestRenderFullBlockWithoutLines(t *testing.T) {
 	cfg := GraphConfig{X: 10, Y: 20, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
 
 	white := color.RGBA{255, 255, 255, 255}
 	colors := []color.RGBA{
@@ -470,7 +508,7 @@ func TestRenderFullBlockWithoutLines(t *testing.T) {
 
 func TestRenderFullBlockNoLines(t *testing.T) {
 	cfg := GraphConfig{X: 10, Y: 20, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, true)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, true)
 
 	white := color.RGBA{255, 255, 255, 255}
 	colors := []color.RGBA{
@@ -497,16 +535,174 @@ func TestRenderFullBlockNoLines(t *testing.T) {
 	}
 }
 
+// tick returns a time base + count*1s, then increments count.
+// Used in tests to step time forward one second at a time.
+func tick(base time.Time, count *int) time.Time {
+	t := base.Add(time.Duration(*count) * time.Second)
+	*count++
+	return t
+}
+
+// ---------------------------------------------------------------------------
+// update — always advances on each call
+// ---------------------------------------------------------------------------
+
+func TestChartUpdateAlwaysAdvances(t *testing.T) {
+	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1, false)
+	base := time.Unix(0, 0)
+
+	// First update always goes through.
+	regions := c.update(50, base)
+	if len(regions) != 1 {
+		t.Fatalf("first update: got %d regions, want 1", len(regions))
+	}
+
+	// Update 500ms later — still advances because chart timing is handled elsewhere.
+	regions = c.update(50, base.Add(500*time.Millisecond))
+	if len(regions) != 1 {
+		t.Errorf("too-soon update: got %d regions, want 1", len(regions))
+	}
+
+	// Update exactly 1s after first — also advances.
+	regions = c.update(50, base.Add(1*time.Second))
+	if len(regions) != 1 {
+		t.Errorf("exact-interval update: got %d regions, want 1", len(regions))
+	}
+
+	// Update another second later — still advances and appends a new dot.
+	regions = c.update(50, base.Add(2*time.Second))
+	if len(regions) != 1 {
+		t.Errorf("repeat update: got %d regions, want 1", len(regions))
+	}
+
+	if got := len(c.history); got != 4 {
+		t.Errorf("history length = %d, want 4", got)
+	}
+}
+
+func TestMetricCacheTurnCadence(t *testing.T) {
+	cache := newMetricCache(2)
+
+	if got, repeats := cache.update(0, 10); got != 10 || repeats != 2 {
+		t.Fatalf("first update = (%v,%d), want (10,2)", got, repeats)
+	}
+	if got, repeats := cache.update(1, 20); got != 10 || repeats != 0 {
+		t.Fatalf("1s update = (%v,%d), want repeated (10,0)", got, repeats)
+	}
+	if got, repeats := cache.update(2, 30); got != 30 || repeats != 2 {
+		t.Fatalf("2s update = (%v,%d), want (30,2)", got, repeats)
+	}
+	if got, repeats := cache.update(3, 40); got != 30 || repeats != 0 {
+		t.Fatalf("3s update = (%v,%d), want repeated (30,0)", got, repeats)
+	}
+}
+
+func TestMetricCacheDefaultsToOneSecond(t *testing.T) {
+	cache := newMetricCache(0)
+	if cache.refreshSec != 1 {
+		t.Fatalf("refreshSec = %d, want 1", cache.refreshSec)
+	}
+}
+
+func TestSlowMetricSkipsIntermediateTurn(t *testing.T) {
+	cache := newMetricCache(2)
+
+	value, repeats := cache.update(0, 42)
+	if value != 42 || repeats != 2 {
+		t.Fatalf("initial update = (%v,%d), want (42,2)", value, repeats)
+	}
+
+	value, repeats = cache.update(1, 99)
+	if value != 42 || repeats != 0 {
+		t.Fatalf("intermediate tick = (%v,%d), want repeated (42,0)", value, repeats)
+	}
+
+	value, repeats = cache.update(2, 99)
+	if value != 99 || repeats != 2 {
+		t.Fatalf("refresh tick = (%v,%d), want (99,2)", value, repeats)
+	}
+}
+
+func TestSlowMetricUsesTurnCountNotWallClock(t *testing.T) {
+	cache := newMetricCache(2)
+
+	value, repeats := cache.update(10, 55)
+	if value != 55 || repeats != 2 {
+		t.Fatalf("turn 10 = (%v,%d), want (55,2)", value, repeats)
+	}
+
+	// Large wall-clock gaps do not exist in this helper anymore; only turns matter.
+	value, repeats = cache.update(11, 66)
+	if value != 55 || repeats != 0 {
+		t.Fatalf("turn 11 = (%v,%d), want repeated (55,0)", value, repeats)
+	}
+
+	value, repeats = cache.update(12, 77)
+	if value != 77 || repeats != 2 {
+		t.Fatalf("turn 12 = (%v,%d), want (77,2)", value, repeats)
+	}
+}
+
+func TestApplyRegions(t *testing.T) {
+	base := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	for y := 0; y < 4; y++ {
+		for x := 0; x < 4; x++ {
+			base.Set(x, y, color.RGBA{255, 255, 255, 255})
+		}
+	}
+
+	region := &DirtyRegion{
+		X: 1,
+		Y: 1,
+		Image: func() *image.RGBA {
+			img := image.NewRGBA(image.Rect(0, 0, 2, 2))
+			for y := 0; y < 2; y++ {
+				for x := 0; x < 2; x++ {
+					img.Set(x, y, color.RGBA{255, 0, 0, 255})
+				}
+			}
+			return img
+		}(),
+	}
+
+	applyRegions(base, []*DirtyRegion{region})
+	if clr, ok := base.At(1, 1).(color.RGBA); !ok || clr.R != 255 || clr.G != 0 || clr.B != 0 {
+		t.Fatalf("composed pixel = %#v, want red", base.At(1, 1))
+	}
+	if clr, ok := base.At(0, 0).(color.RGBA); !ok || clr.R != 255 || clr.G != 255 || clr.B != 255 {
+		t.Fatalf("base pixel = %#v, want white", base.At(0, 0))
+	}
+}
+
+func TestChartUpdateRepeated(t *testing.T) {
+	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
+	c := newChart(cfg, 4, ThresholdConfig{}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1, false)
+
+	regions := c.updateRepeated(25, 2)
+	if len(regions) != 1 {
+		t.Fatalf("got %d regions, want 1", len(regions))
+	}
+	if got := len(c.history); got != 2 {
+		t.Fatalf("history length = %d, want 2", got)
+	}
+	if c.history[0] != 25 || c.history[1] != 25 {
+		t.Fatalf("history = %#v, want two identical values", c.history)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // update — fill phase (with lines)
 // ---------------------------------------------------------------------------
 
 func TestUpdateFillPhase(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
+	base := time.Unix(0, 0)
+	n := 0
 
 	// First update: lines drawn, block covers full height (50px)
-	regions := c.update(30)
+	regions := c.update(30, tick(base, &n))
 	if len(regions) != 1 {
 		t.Fatalf("first update: got %d regions, want 1", len(regions))
 	}
@@ -519,7 +715,7 @@ func TestUpdateFillPhase(t *testing.T) {
 	}
 
 	// Second update: no lines, block covers rows 1..48 only (48px)
-	regions = c.update(30)
+	regions = c.update(30, tick(base, &n))
 	if len(regions) != 1 {
 		t.Fatalf("second update: got %d regions, want 1", len(regions))
 	}
@@ -533,7 +729,7 @@ func TestUpdateFillPhase(t *testing.T) {
 
 	// Fill remaining
 	for i := 0; i < 3; i++ {
-		c.update(30)
+		c.update(30, tick(base, &n))
 	}
 	if !c.filled {
 		t.Error("should be filled")
@@ -546,10 +742,12 @@ func TestUpdateFillPhase(t *testing.T) {
 
 func TestUpdateFillPhaseNoLines(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, true)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, true)
+	base := time.Unix(0, 0)
+	n := 0
 
 	// First update: no lines, block covers full height (50px)
-	regions := c.update(30)
+	regions := c.update(30, tick(base, &n))
 	if len(regions) != 1 {
 		t.Fatalf("first update: got %d regions, want 1", len(regions))
 	}
@@ -562,7 +760,7 @@ func TestUpdateFillPhaseNoLines(t *testing.T) {
 	}
 
 	// Second update: still full height
-	regions = c.update(30)
+	regions = c.update(30, tick(base, &n))
 	if len(regions) != 1 {
 		t.Fatalf("second update: got %d regions, want 1", len(regions))
 	}
@@ -580,13 +778,15 @@ func TestUpdateFillPhaseNoLines(t *testing.T) {
 
 func TestUpdateShiftPhase(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
+	base := time.Unix(0, 0)
+	n := 0
 
 	for i := 0; i < 5; i++ {
-		c.update(30)
+		c.update(30, tick(base, &n))
 	}
 
-	regions := c.update(90)
+	regions := c.update(90, tick(base, &n))
 	if len(regions) != 1 {
 		t.Fatalf("shift update: got %d regions, want 1", len(regions))
 	}
@@ -598,12 +798,14 @@ func TestUpdateShiftPhase(t *testing.T) {
 
 func TestUpdateNoChange(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
+	base := time.Unix(0, 0)
+	n := 0
 
 	for i := 0; i < 5; i++ {
-		c.update(30)
+		c.update(30, tick(base, &n))
 	}
-	regions := c.update(30)
+	regions := c.update(30, tick(base, &n))
 	if len(regions) != 1 {
 		t.Errorf("same value update: got %d regions, want 1 (DEBUG full block)", len(regions))
 	}
@@ -615,10 +817,12 @@ func TestUpdateNoChange(t *testing.T) {
 
 func TestUpdateClamping(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
+	base := time.Unix(0, 0)
+	n := 0
 
-	c.update(-10)
-	regions := c.update(150)
+	c.update(-10, tick(base, &n))
+	regions := c.update(150, tick(base, &n))
 	if len(regions) != 1 {
 		t.Fatalf("clamping: got %d regions, want 1", len(regions))
 	}
@@ -630,13 +834,15 @@ func TestUpdateClamping(t *testing.T) {
 
 func TestUpdateShiftVarying(t *testing.T) {
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, ColorConfig{}, color.RGBA{255, 255, 255, 255}, 1000, false)
+	base := time.Unix(0, 0)
+	n := 0
 
 	for i := 0; i < 5; i++ {
-		c.update(10)
+		c.update(10, tick(base, &n))
 	}
-	c.update(90)
-	regions := c.update(50)
+	c.update(90, tick(base, &n))
+	regions := c.update(50, tick(base, &n))
 	if len(regions) != 1 {
 		t.Fatalf("varying shift: got %d regions, want 1", len(regions))
 	}
@@ -647,11 +853,18 @@ func TestUpdateShiftVarying(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestUpdateRightAlignedFill(t *testing.T) {
+	cc := ColorConfig{
+		Green:  RGBA{color.RGBA{0, 255, 0, 255}},
+		Yellow: RGBA{color.RGBA{255, 255, 0, 255}},
+		Red:    RGBA{color.RGBA{255, 0, 0, 255}},
+	}
 	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
-	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, false)
+	c := newChart(cfg, 4, ThresholdConfig{Green: 0, Yellow: 50, Red: 80}, cc, color.RGBA{255, 255, 255, 255}, 1000, false)
+	base := time.Unix(0, 0)
+	n := 0
 
 	// First dot — full block with lines
-	regions := c.update(30)
+	regions := c.update(30, tick(base, &n))
 	if len(regions) != 1 {
 		t.Fatal("first update: expected 1 region")
 	}
@@ -665,7 +878,7 @@ func TestUpdateRightAlignedFill(t *testing.T) {
 	}
 
 	// Second dot — block without lines (offset Y by 1)
-	regions = c.update(30)
+	regions = c.update(30, tick(base, &n))
 	if len(regions) != 1 {
 		t.Fatal("second update: expected 1 region")
 	}
@@ -676,5 +889,205 @@ func TestUpdateRightAlignedFill(t *testing.T) {
 	}
 	if clr, ok := regions[0].Image.At(16, dotY2).(color.RGBA); !ok || colorName(clr) != "green" {
 		t.Errorf("dot at col 4 not green")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// dotFillColor
+// ---------------------------------------------------------------------------
+
+func TestDotFillColor(t *testing.T) {
+	thresh := ThresholdConfig{Green: 0, Yellow: 50, Red: 80}
+	cc := ColorConfig{
+		GreenFill:  RGBA{color.RGBA{144, 238, 144, 255}},
+		YellowFill: RGBA{color.RGBA{255, 255, 224, 255}},
+		RedFill:    RGBA{color.RGBA{255, 182, 193, 255}},
+	}
+	cfg := GraphConfig{Width: 20, Height: 10}
+	c := newChart(cfg, 4, thresh, cc, color.RGBA{255, 255, 255, 255}, 1000, false)
+
+	tests := []struct {
+		value float64
+		want  color.RGBA
+	}{
+		{0, cc.GreenFill.RGBA}, {25, cc.GreenFill.RGBA}, {49, cc.GreenFill.RGBA},
+		{50, cc.YellowFill.RGBA}, {65, cc.YellowFill.RGBA}, {79, cc.YellowFill.RGBA},
+		{80, cc.RedFill.RGBA}, {95, cc.RedFill.RGBA}, {100, cc.RedFill.RGBA},
+	}
+	for _, tt := range tests {
+		got := c.dotFillColor(tt.value)
+		if got != tt.want {
+			t.Errorf("dotFillColor(%v) = %v, want %v", tt.value, got, tt.want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// renderFullBlock — fill area below dots
+// ---------------------------------------------------------------------------
+
+func TestRenderFullBlockFillBelowDot(t *testing.T) {
+	thresh := ThresholdConfig{Green: 0, Yellow: 50, Red: 80}
+	cc := ColorConfig{
+		GreenFill:  RGBA{color.RGBA{144, 238, 144, 255}},
+		YellowFill: RGBA{color.RGBA{255, 255, 224, 255}},
+		RedFill:    RGBA{color.RGBA{255, 182, 193, 255}},
+	}
+	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
+	c := newChart(cfg, 4, thresh, cc, color.RGBA{255, 255, 255, 255}, 1000, true) // noLines for simplicity
+
+	white := color.RGBA{255, 255, 255, 255}
+	colors := []color.RGBA{
+		{0, 255, 0, 255}, {255, 255, 0, 255}, {255, 0, 0, 255}, white, white,
+	}
+	values := []float64{20, 50, 80, 0, 0}
+
+	r := c.renderFullBlock(colors, values, false)
+
+	// Col 0: green dot at value 20, fill below should be green_fill
+	dotY := c.valueToY(20)
+	// Dot pixel should be green
+	if clr, ok := r.Image.At(0, dotY).(color.RGBA); !ok || clr != (color.RGBA{0, 255, 0, 255}) {
+		t.Errorf("col 0 dot not green at y=%d", dotY)
+	}
+	// Pixel below dot should be green_fill
+	fillY := dotY + c.dotSize
+	if fillY < 50 {
+		if clr, ok := r.Image.At(0, fillY).(color.RGBA); !ok || clr != cc.GreenFill.RGBA {
+			t.Errorf("col 0 fill at y=%d = %v, want %v", fillY, clr, cc.GreenFill.RGBA)
+		}
+	}
+
+	// Col 1: yellow dot at value 50, fill below should be yellow_fill
+	dotY = c.valueToY(50)
+	if clr, ok := r.Image.At(4, dotY).(color.RGBA); !ok || clr != (color.RGBA{255, 255, 0, 255}) {
+		t.Errorf("col 1 dot not yellow at y=%d", dotY)
+	}
+	fillY = dotY + c.dotSize
+	if fillY < 50 {
+		if clr, ok := r.Image.At(4, fillY).(color.RGBA); !ok || clr != cc.YellowFill.RGBA {
+			t.Errorf("col 1 fill at y=%d = %v, want %v", fillY, clr, cc.YellowFill.RGBA)
+		}
+	}
+
+	// Col 2: red dot at value 80, fill below should be red_fill
+	dotY = c.valueToY(80)
+	if clr, ok := r.Image.At(8, dotY).(color.RGBA); !ok || clr != (color.RGBA{255, 0, 0, 255}) {
+		t.Errorf("col 2 dot not red at y=%d", dotY)
+	}
+	fillY = dotY + c.dotSize
+	if fillY < 50 {
+		if clr, ok := r.Image.At(8, fillY).(color.RGBA); !ok || clr != cc.RedFill.RGBA {
+			t.Errorf("col 2 fill at y=%d = %v, want %v", fillY, clr, cc.RedFill.RGBA)
+		}
+	}
+
+	// Col 3: no dot (white), should remain white
+	if clr, ok := r.Image.At(12, 25).(color.RGBA); !ok || clr != white {
+		t.Errorf("col 3 should be white, got %v", clr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// batchBlocks — fill area below dots
+// ---------------------------------------------------------------------------
+
+func TestBatchBlocksFillBelowDot(t *testing.T) {
+	thresh := ThresholdConfig{Green: 0, Yellow: 50, Red: 80}
+	cc := ColorConfig{
+		GreenFill:  RGBA{color.RGBA{144, 238, 144, 255}},
+		YellowFill: RGBA{color.RGBA{255, 255, 224, 255}},
+		RedFill:    RGBA{color.RGBA{255, 182, 193, 255}},
+	}
+	cfg := GraphConfig{X: 0, Y: 0, Width: 20, Height: 50}
+	c := newChart(cfg, 4, thresh, cc, color.RGBA{255, 255, 255, 255}, 1000, false)
+	white := color.RGBA{255, 255, 255, 255}
+
+	changed := []bool{false, true, true, false, false}
+	colors := []color.RGBA{white, {0, 255, 0, 255}, {255, 0, 0, 255}, white, white}
+	values := []float64{0, 30, 90, 0, 0}
+
+	regions := c.batchBlocks(changed, colors, values)
+	if len(regions) != 1 {
+		t.Fatalf("got %d regions, want 1", len(regions))
+	}
+	r := regions[0]
+
+	// Col 1 (block x=0): green dot, fill below should be green_fill
+	dotY := c.valueToY(30)
+	if clr, ok := r.Image.At(0, dotY).(color.RGBA); !ok || clr != (color.RGBA{0, 255, 0, 255}) {
+		t.Errorf("col 1 dot not green at y=%d", dotY)
+	}
+	fillY := dotY + c.dotSize
+	if fillY < 50 {
+		if clr, ok := r.Image.At(0, fillY).(color.RGBA); !ok || clr != cc.GreenFill.RGBA {
+			t.Errorf("col 1 fill at y=%d = %v, want %v", fillY, clr, cc.GreenFill.RGBA)
+		}
+	}
+
+	// Col 2 (block x=4): red dot, fill below should be red_fill
+	dotY = c.valueToY(90)
+	if clr, ok := r.Image.At(4, dotY).(color.RGBA); !ok || clr != (color.RGBA{255, 0, 0, 255}) {
+		t.Errorf("col 2 dot not red at y=%d", dotY)
+	}
+	fillY = dotY + c.dotSize
+	if fillY < 50 {
+		if clr, ok := r.Image.At(4, fillY).(color.RGBA); !ok || clr != cc.RedFill.RGBA {
+			t.Errorf("col 2 fill at y=%d = %v, want %v", fillY, clr, cc.RedFill.RGBA)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Config loading with colors
+// ---------------------------------------------------------------------------
+
+func TestLoadConfigWithColors(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	_ = os.WriteFile(path, []byte(`{
+		"screen": {"width": 320, "height": 480},
+		"dot_size": 4,
+		"thresholds": {"green": 0, "yellow": 50, "red": 80},
+		"colors": {
+			"green":       "#00FF00",
+			"yellow":      "#FFFF00",
+			"red":         "#FF0000",
+			"green_fill":  "#90EE90",
+			"yellow_fill": "#FFFFE0",
+			"red_fill":    "#FFB6C1",
+			"background":  "#FFFFFF",
+			"font_color":  "#000000"
+		},
+		"graphs": {"cpu": {"x": 10, "y": 16, "width": 300, "height": 96}}
+	}`), 0644)
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Colors.GreenFill.RGBA != (color.RGBA{144, 238, 144, 255}) {
+		t.Errorf("green_fill = %v, want {144, 238, 144, 255}", cfg.Colors.GreenFill.RGBA)
+	}
+	if cfg.Colors.YellowFill.RGBA != (color.RGBA{255, 255, 224, 255}) {
+		t.Errorf("yellow_fill = %v, want {255, 255, 224, 255}", cfg.Colors.YellowFill.RGBA)
+	}
+	if cfg.Colors.RedFill.RGBA != (color.RGBA{255, 182, 193, 255}) {
+		t.Errorf("red_fill = %v, want {255, 182, 193, 255}", cfg.Colors.RedFill.RGBA)
+	}
+	if cfg.Colors.Green.RGBA != (color.RGBA{0, 255, 0, 255}) {
+		t.Errorf("green = %v, want {0, 255, 0, 255}", cfg.Colors.Green.RGBA)
+	}
+	if cfg.Colors.Yellow.RGBA != (color.RGBA{255, 255, 0, 255}) {
+		t.Errorf("yellow = %v, want {255, 255, 0, 255}", cfg.Colors.Yellow.RGBA)
+	}
+	if cfg.Colors.Red.RGBA != (color.RGBA{255, 0, 0, 255}) {
+		t.Errorf("red = %v, want {255, 0, 0, 255}", cfg.Colors.Red.RGBA)
+	}
+	if cfg.Colors.Background.RGBA != (color.RGBA{255, 255, 255, 255}) {
+		t.Errorf("background = %v, want {255, 255, 255, 255}", cfg.Colors.Background.RGBA)
+	}
+	if cfg.Colors.FontColor.RGBA != (color.RGBA{0, 0, 0, 255}) {
+		t.Errorf("font_color = %v, want {0, 0, 0, 255}", cfg.Colors.FontColor.RGBA)
 	}
 }

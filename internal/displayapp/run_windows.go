@@ -2,7 +2,7 @@
 
 // turing-display-go: Communicate with Turing Smart Screen displays from Go.
 // Build: go build -ldflags="-H windowsgui" -o turing-display.exe
-package main
+package displayapp
 
 import (
 	"flag"
@@ -71,7 +71,18 @@ var sectionStart = [4]int{0, 120, 240, 360}
 // Main
 // ---------------------------------------------------------------------------
 
-func main() {
+func shouldStop(interrupt <-chan os.Signal, exit <-chan struct{}) bool {
+	select {
+	case <-interrupt:
+		return true
+	case <-exit:
+		return true
+	default:
+		return false
+	}
+}
+
+func Run() {
 	flag.Parse()
 	log.SetFlags(0)
 
@@ -113,9 +124,10 @@ func main() {
 	dbg.Printf("Response (%d bytes): %s", len(resp), interpretHello(resp))
 
 	// 4. Load config
-	chartCfg, err := loadConfig("config.json")
+	configPath := appConfigPath()
+	chartCfg, err := loadConfig(configPath)
 	if err != nil {
-		dbg.Printf("Warning: no config.json: %v", err)
+		dbg.Printf("Warning: no %s: %v", configPath, err)
 		chartCfg = nil
 	}
 
@@ -147,11 +159,16 @@ func main() {
 
 	// 7. Init charts
 	var charts [4]*Chart // cpu, ram, gpu, vram
+	var metricCaches [4]metricCache
+	for i := range metricCaches {
+		metricCaches[i] = newMetricCache(1)
+	}
 	if chartCfg != nil {
 		names := [4]string{"cpu", "ram", "gpu", "vram"}
 		for i, name := range names {
 			if gCfg, ok := chartCfg.Graphs[name]; ok {
-				charts[i] = newChart(gCfg, chartCfg.DotSize, chartCfg.Thresholds, true) // noLines=true
+				charts[i] = newChart(gCfg, chartCfg.DotSize, chartCfg.Thresholds, chartCfg.Colors, chartCfg.Colors.Background.RGBA, gCfg.RefreshSec, true)
+				metricCaches[i] = newMetricCache(gCfg.RefreshSec)
 				dbg.Printf("%s chart: %dx%d at (%d,%d), capacity=%d",
 					name, gCfg.Width, gCfg.Height, gCfg.X, gCfg.Y, charts[i].capacity)
 			}
@@ -165,12 +182,17 @@ func main() {
 		"GPU",
 		fmt.Sprintf("VRAM - %s", formatBytesGiB(stats.totalBytes)),
 	}
-	base := renderBaseFrame(labels)
+	fontColor := color.RGBA{0, 0, 0, 255}
+	if chartCfg != nil {
+		fontColor = chartCfg.Colors.FontColor.RGBA
+	}
+	base := renderBaseFrame(labels, fontColor)
 	if err := sendDisplayBitmapRevA(handle, 0, 0, screenWidth-1, screenHeight-1, base); err != nil {
 		dbg.Printf("Error: %v", err)
 		os.Exit(1)
 	}
 	dbg.Printf("Base frame sent.")
+	screenFrame := newScreenFrame(base)
 
 	// 9. Signal handling
 	interrupt := make(chan os.Signal, 1)
@@ -178,7 +200,7 @@ func main() {
 	defer signal.Stop(interrupt)
 
 	// 10. Update function
-	updateStats := func() error {
+	updateStats := func(turn int) error {
 		stats, err := statsQuery.snapshot()
 		if err != nil {
 			return err
@@ -199,23 +221,38 @@ func main() {
 			vramPct = float64(stats.usedBytes) * 100 / float64(stats.totalBytes)
 		}
 
-		// Update each chart and send dirty regions.
+		cpuPct, cpuRepeats := metricCaches[0].update(turn, cpuPct)
+		ramPct, ramRepeats := metricCaches[1].update(turn, ramPct)
+		gpuPct, gpuRepeats := metricCaches[2].update(turn, gpuPct)
+		vramPct, vramRepeats := metricCaches[3].update(turn, vramPct)
+
+		// Update each chart and only send the regions that changed.
 		for i, ch := range charts {
 			if ch == nil {
 				continue
 			}
 			var value float64
+			var repeats int
 			switch i {
 			case 0:
 				value = cpuPct
+				repeats = cpuRepeats
 			case 1:
 				value = ramPct
+				repeats = ramRepeats
 			case 2:
 				value = gpuPct
+				repeats = gpuRepeats
 			case 3:
 				value = vramPct
+				repeats = vramRepeats
 			}
-			for _, r := range ch.update(value) {
+			if repeats == 0 {
+				continue
+			}
+			dirtyRegions := ch.updateRepeated(value, repeats)
+			applyRegions(screenFrame, dirtyRegions)
+			for _, r := range dirtyRegions {
 				if err := sendDisplayBitmapRevA(handle, r.X, r.Y,
 					r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
 					return err
@@ -229,29 +266,25 @@ func main() {
 	}
 
 	// Initial update
-	if err := updateStats(); err != nil {
+	turn := 0
+	if err := updateStats(turn); err != nil {
 		dbg.Printf("Error: %v", err)
 		os.Exit(1)
 	}
 	dbg.Printf("Running... (Ctrl+C to stop)")
 
 	// 11. Main loop
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
 	for {
-		select {
-		case <-interrupt:
-			dbg.Printf("Stopped.")
-			return
-		case <-exitApp:
+		if shouldStop(interrupt, exitApp) {
 			dbg.Printf("Exit via tray menu.")
 			return
-		case <-ticker.C:
-			if err := updateStats(); err != nil {
-				dbg.Printf("Error: %v", err)
-				os.Exit(1)
-			}
+		}
+
+		time.Sleep(1 * time.Second)
+		turn++
+		if err := updateStats(turn); err != nil {
+			dbg.Printf("Error: %v", err)
+			os.Exit(1)
 		}
 	}
 }
@@ -265,7 +298,7 @@ func main() {
 //   rows 14..119: chart area (106px)
 // ---------------------------------------------------------------------------
 
-func renderBaseFrame(labels [4]string) *image.RGBA {
+func renderBaseFrame(labels [4]string, fontColor color.RGBA) *image.RGBA {
 	white := color.RGBA{255, 255, 255, 255}
 	gray := color.RGBA{divColor, divColor, divColor, 255}
 
@@ -306,7 +339,7 @@ func renderBaseFrame(labels [4]string) *image.RGBA {
 		// Draw label text.
 		d := &font.Drawer{
 			Dst:  img,
-			Src:  image.NewUniform(color.RGBA{0, 0, 0, 255}),
+			Src:  image.NewUniform(fontColor),
 			Face: face,
 		}
 		d.Dot = fixed.P(rectX+padding/2, baseline)

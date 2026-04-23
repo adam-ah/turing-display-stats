@@ -1,0 +1,26 @@
+{
+  "screen": { "width": 320, "height": 480 },
+  "dot_size": 4,
+  "font_size": 13,
+  "thresholds": {
+    "green":  0,
+    "yellow": 50,
+    "red":    80
+  },
+  "colors": {
+    "green":       "#117311",
+    "yellow":      "#ffdd00",
+    "red":         "#ab0202",
+    "green_fill":  "#90EE90",
+    "yellow_fill": "#faf0cd",
+    "red_fill":    "#FFB6C1",
+    "background":  "#FFFFFF",
+    "font_color":  "#000000"
+  },
+  "graphs": {
+    "cpu":  { "x": 10, "y": 16,  "width": 300, "height": 96, "refresh_sec": 1 },
+    "ram":  { "x": 10, "y": 136, "width": 300, "height": 96, "refresh_sec": 2 },
+    "gpu":  { "x": 10, "y": 256, "width": 300, "height": 96, "refresh_sec": 1 },
+    "vram": { "x": 10, "y": 376, "width": 300, "height": 96, "refresh_sec": 2 }
+  }
+}

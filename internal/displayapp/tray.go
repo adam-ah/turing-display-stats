@@ -1,10 +1,9 @@
 //go:build windows
 
-package main
+package displayapp
 
 import (
 	"fmt"
-	"path/filepath"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -199,11 +198,10 @@ func createTrayWindow() error {
 	}
 	mainWnd = ret
 
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		return fmt.Errorf("runtime.Caller failed")
+	iconPath, err := repoAssetPath("res", "icons", "monitor-icon-17865", "icon.ico")
+	if err != nil {
+		return err
 	}
-	iconPath := filepath.Join(filepath.Dir(file), "..", "res", "icons", "monitor-icon-17865", "icon.ico")
 	iconPathPtr, err := windows.UTF16PtrFromString(iconPath)
 	if err != nil {
 		return err
@@ -340,7 +338,7 @@ func showAbout() {
 }
 
 func openConfigFile() {
-	path, _ := windows.UTF16PtrFromString("config.json")
+	path, _ := windows.UTF16PtrFromString(appConfigPath())
 	procShellExecute.Call(0, 0, uintptr(unsafe.Pointer(path)), 0, 0, 1)
 }
 

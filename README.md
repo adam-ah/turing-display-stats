@@ -21,8 +21,9 @@ Communicate with a **Turing Smart Screen 3.5"** (or compatible) display from Go 
 ```powershell
 cd go_display
 go mod tidy
-go build -o turing-display.exe
-.\turing-display.exe
+go build -o dist/turing-display.exe ./cmd/turing-display
+Copy-Item config\config.json dist\config.json
+.\dist\turing-display.exe
 ```
 
 ## How it works
