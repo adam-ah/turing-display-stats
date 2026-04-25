@@ -7,19 +7,13 @@ package app
 import (
 	"flag"
 	"fmt"
-	"image"
 	"image/color"
-	"image/draw"
 	"log"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/image/font"
-	"golang.org/x/image/font/basicfont"
-	"golang.org/x/image/math/fixed"
 
 	"turing-display-go/internal/chart"
 	"turing-display-go/internal/frame"
@@ -47,20 +41,6 @@ func (l *debugLogger) Printf(format string, v ...interface{}) {
 }
 
 var dbg debugLogger
-
-const (
-	screenWidth  = 320
-	screenHeight = 480
-	divColor     = 0x80
-)
-
-const (
-	sectionHeight   = 120
-	labelZoneHeight = 15
-	chartOffset     = 16
-)
-
-var sectionStart = [4]int{0, 120, 240, 360}
 
 func shouldStop(interrupt <-chan os.Signal, exit <-chan struct{}) bool {
 	select {
@@ -165,10 +145,12 @@ func Run() {
 		fmt.Sprintf("VRAM - %s", win.FormatBytesGiB(stats.TotalBytes)),
 	}
 	fontColor := color.RGBA{0, 0, 0, 255}
+	bgColor := color.RGBA{255, 255, 255, 255}
 	if chartCfg != nil {
 		fontColor = chartCfg.Colors.FontColor.RGBA
+		bgColor = chartCfg.Colors.Background.RGBA
 	}
-	base := renderBaseFrame(labels, fontColor)
+	base := renderBaseFrame(labels, fontColor, bgColor)
 	if err := win.SendDisplayBitmapRevA(handle, 0, 0, screenWidth-1, screenHeight-1, base); err != nil {
 		dbg.Printf("Error: %v", err)
 		os.Exit(1)
@@ -264,46 +246,4 @@ func Run() {
 			os.Exit(1)
 		}
 	}
-}
-
-func renderBaseFrame(labels [4]string, fontColor color.RGBA) *image.RGBA {
-	white := color.RGBA{255, 255, 255, 255}
-	gray := color.RGBA{divColor, divColor, divColor, 255}
-
-	img := image.NewRGBA(image.Rect(0, 0, screenWidth, screenHeight))
-	draw.Draw(img, img.Bounds(), &image.Uniform{white}, image.Point{}, draw.Src)
-
-	face := basicfont.Face7x13
-	metrics := face.Metrics()
-
-	for i, label := range labels {
-		start := sectionStart[i]
-		for x := 0; x < screenWidth; x++ {
-			img.Set(x, start, gray)
-		}
-
-		labelTop := start + 1
-		textWidth := font.MeasureString(face, label).Ceil()
-		padding := 4
-		rectW := textWidth + padding
-		rectX := (screenWidth - rectW) / 2
-
-		textH := metrics.Ascent.Ceil() + metrics.Descent.Ceil()
-		textTop := labelTop + (labelZoneHeight-textH)/2
-		baseline := textTop + metrics.Ascent.Ceil()
-		textBot := baseline + metrics.Descent.Ceil()
-
-		draw.Draw(img, image.Rect(rectX, textTop, rectX+rectW, textBot+1),
-			&image.Uniform{white}, image.Point{}, draw.Src)
-
-		d := &font.Drawer{
-			Dst:  img,
-			Src:  image.NewUniform(fontColor),
-			Face: face,
-		}
-		d.Dot = fixed.P(rectX+padding/2, baseline)
-		d.DrawString(label)
-	}
-
-	return img
 }
