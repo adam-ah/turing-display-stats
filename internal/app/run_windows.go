@@ -42,6 +42,11 @@ func (l *debugLogger) Printf(format string, v ...interface{}) {
 
 var dbg debugLogger
 
+func fatalApp(err error, recovered any) {
+	win.ShowErrorDialog(fatalFailureTitle, formatFatalFailure(err, recovered))
+	os.Exit(1)
+}
+
 func shouldStop(interrupt <-chan os.Signal, exit <-chan struct{}) bool {
 	select {
 	case <-interrupt:
@@ -54,6 +59,12 @@ func shouldStop(interrupt <-chan os.Signal, exit <-chan struct{}) bool {
 }
 
 func Run() {
+	defer func() {
+		if r := recover(); r != nil {
+			fatalApp(nil, r)
+		}
+	}()
+
 	flag.Parse()
 	log.SetFlags(0)
 
@@ -69,7 +80,7 @@ func Run() {
 	comPort, devName, err := win.FindTuringDisplay()
 	if err != nil {
 		dbg.Printf("Error: %v", err)
-		os.Exit(1)
+		fatalApp(err, nil)
 	}
 	dbg.Printf("Found: %s on %s", devName, comPort)
 
@@ -77,7 +88,7 @@ func Run() {
 	handle, err := win.OpenSerial(comPort)
 	if err != nil {
 		dbg.Printf("Error: %v", err)
-		os.Exit(1)
+		fatalApp(err, nil)
 	}
 	defer win.CloseSerial(handle)
 	dbg.Printf("Serial port opened.")
@@ -86,7 +97,7 @@ func Run() {
 	resp, err := win.SendHello(handle)
 	if err != nil {
 		dbg.Printf("Error: %v", err)
-		os.Exit(1)
+		fatalApp(err, nil)
 	}
 	dbg.Printf("Response (%d bytes): %s", len(resp), win.InterpretHello(resp))
 
@@ -100,25 +111,25 @@ func Run() {
 	statsQuery, err := win.NewGpuPdhQuery()
 	if err != nil {
 		dbg.Printf("Error: %v", err)
-		os.Exit(1)
+		fatalApp(err, nil)
 	}
 	defer statsQuery.Close()
 
 	cpuSampler, err := win.NewCpuUsageSampler()
 	if err != nil {
 		dbg.Printf("Error: %v", err)
-		os.Exit(1)
+		fatalApp(err, nil)
 	}
 
 	stats, err := statsQuery.Snapshot()
 	if err != nil {
 		dbg.Printf("Error: %v", err)
-		os.Exit(1)
+		fatalApp(err, nil)
 	}
 	memory, err := win.ReadSystemMemoryStats()
 	if err != nil {
 		dbg.Printf("Error: %v", err)
-		os.Exit(1)
+		fatalApp(err, nil)
 	}
 
 	var charts [4]*chart.Chart
@@ -153,7 +164,7 @@ func Run() {
 	base := renderBaseFrame(labels, fontColor, bgColor)
 	if err := win.SendDisplayBitmapRevA(handle, 0, 0, screenWidth-1, screenHeight-1, base); err != nil {
 		dbg.Printf("Error: %v", err)
-		os.Exit(1)
+		fatalApp(err, nil)
 	}
 	dbg.Printf("Base frame sent.")
 	screenFrame := frame.NewScreenFrame(base)
@@ -229,7 +240,7 @@ func Run() {
 	turn := 0
 	if err := updateStats(turn); err != nil {
 		dbg.Printf("Error: %v", err)
-		os.Exit(1)
+		fatalApp(err, nil)
 	}
 	dbg.Printf("Running... (Ctrl+C to stop)")
 
@@ -243,7 +254,7 @@ func Run() {
 		turn++
 		if err := updateStats(turn); err != nil {
 			dbg.Printf("Error: %v", err)
-			os.Exit(1)
+			fatalApp(err, nil)
 		}
 	}
 }

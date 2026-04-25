@@ -61,7 +61,6 @@ var (
 	procDestroyMenu         = user32.NewProc("DestroyMenu")
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
 	procShellExecute        = shell32.NewProc("ShellExecuteW")
-	procMessageBox          = user32.NewProc("MessageBoxW")
 	procGetMessage          = user32.NewProc("GetMessageW")
 	procTranslateMessage    = user32.NewProc("TranslateMessage")
 	procDispatchMessage     = user32.NewProc("DispatchMessageW")
