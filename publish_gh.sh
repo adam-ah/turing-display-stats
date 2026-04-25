@@ -14,6 +14,7 @@ info() { echo "==> $*"; }
 [[ -n "$TAG" ]] || die "Usage: $0 <tag>  (e.g. v0.1.0)"
 command -v gh    >/dev/null 2>&1 || die "'gh' CLI not found — install it first"
 command -v go    >/dev/null 2>&1 || die "'go' not found"
+command -v zip   >/dev/null 2>&1 || die "'zip' not found — install it first"
 
 # Make sure working tree is clean
 [[ -z "$(git -C "$MODULE_DIR" status --porcelain)" ]] || die "Working tree is not clean. Commit or stash changes first."
@@ -41,6 +42,9 @@ mkdir -p "$DIST_DIR"
 info "Copying config..."
 cp "$MODULE_DIR/config/config.json" "$DIST_DIR/config.json"
 
+info "Zipping release..."
+cd "$DIST_DIR" && zip -r "$MODULE_DIR/dist/turing-display.zip" .
+
 info "Build complete: $DIST_DIR"
 ls -lh "$DIST_DIR"
 
@@ -59,8 +63,7 @@ info "Creating GitHub release..."
 gh release create "$TAG" \
     --title "$TAG" \
     --notes "Release $TAG" \
-    "$DIST_DIR/turing-display.exe" \
-    "$DIST_DIR/config.json"
+    "$DIST_DIR/turing-display.zip"
 
 info "Done! Release published at:"
 gh release view "$TAG" --json url --jq '.url'
