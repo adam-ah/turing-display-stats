@@ -526,7 +526,7 @@ func (q *GpuPdhQuery) formattedArray(counter windows.Handle, format uint32) ([]p
 		if status == 0 {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("PdhGetFormattedCounterArrayW(size): 0x%08X", status)
+		return nil, PdhError{Op: "PdhGetFormattedCounterArrayW(size)", Status: uintptr(status)}
 	}
 
 	buf := make([]byte, bufSize)
@@ -538,7 +538,7 @@ func (q *GpuPdhQuery) formattedArray(counter windows.Handle, format uint32) ([]p
 		uintptr(unsafe.Pointer(&buf[0])),
 	)
 	if status != 0 {
-		return nil, fmt.Errorf("PdhGetFormattedCounterArrayW(data): 0x%08X", status)
+		return nil, PdhError{Op: "PdhGetFormattedCounterArrayW(data)", Status: uintptr(status)}
 	}
 
 	items := make([]pdhFmtCounterValueItem, 0, itemCount)

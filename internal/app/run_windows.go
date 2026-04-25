@@ -21,12 +21,6 @@ import (
 	"turing-display-go/internal/win"
 )
 
-var debugEnabled bool
-
-func init() {
-	flag.BoolVar(&debugEnabled, "debug", false, "enable console output")
-}
-
 type debugLogger struct {
 	mu sync.Mutex
 }
@@ -69,6 +63,10 @@ func Run() {
 	log.SetFlags(0)
 
 	dbg.Printf("=== Turing Smart Screen ===")
+
+	if title, message, ok := debugStartupDialog(); ok {
+		win.ShowErrorDialog(title, message)
+	}
 
 	if err := win.InitTray(); err != nil {
 		dbg.Printf("tray init warning: %v", err)
@@ -237,10 +235,32 @@ func Run() {
 		return nil
 	}
 
+	recoverStats := func(err error) (bool, error) {
+		if !win.IsRetryablePdhError(err) {
+			return false, err
+		}
+		dbg.Printf("GPU stats query failed with retryable PDH error: %v", err)
+		rebuilt, rebuildErr := win.NewGpuPdhQuery()
+		if rebuildErr != nil {
+			dbg.Printf("GPU stats query rebuild failed: %v", rebuildErr)
+			return false, rebuildErr
+		}
+		oldQuery := statsQuery
+		statsQuery = rebuilt
+		oldQuery.Close()
+		dbg.Printf("GPU stats query rebuilt after PDH error.")
+		return true, nil
+	}
+
 	turn := 0
 	if err := updateStats(turn); err != nil {
-		dbg.Printf("Error: %v", err)
-		fatalApp(err, nil)
+		if recovered, _ := recoverStats(err); recovered {
+			err = updateStats(turn)
+		}
+		if err != nil {
+			dbg.Printf("Error: %v", err)
+			fatalApp(err, nil)
+		}
 	}
 	dbg.Printf("Running... (Ctrl+C to stop)")
 
@@ -253,6 +273,15 @@ func Run() {
 		time.Sleep(1 * time.Second)
 		turn++
 		if err := updateStats(turn); err != nil {
+			if win.IsRetryablePdhError(err) {
+				if recovered, _ := recoverStats(err); recovered {
+					if err = updateStats(turn); err == nil {
+						continue
+					}
+					dbg.Printf("GPU stats refresh still failing after rebuild: %v", err)
+				}
+				continue
+			}
 			dbg.Printf("Error: %v", err)
 			fatalApp(err, nil)
 		}

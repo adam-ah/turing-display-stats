@@ -6,6 +6,7 @@ import (
 )
 
 const fatalFailureTitle = "Turing Display error"
+const debugStartupDialogMessage = "In debug mode now"
 
 func formatFatalFailure(err error, recovered any) string {
 	if recovered != nil {
@@ -37,4 +38,11 @@ func formatRecoveredPanic(recovered any) string {
 		panicText = "unknown panic"
 	}
 	return "The program crashed because of an unexpected panic:\n" + panicText
+}
+
+func debugStartupDialog() (title, message string, ok bool) {
+	if !debugEnabled {
+		return "", "", false
+	}
+	return fatalFailureTitle, debugStartupDialogMessage, true
 }
