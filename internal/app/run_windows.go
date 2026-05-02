@@ -88,16 +88,10 @@ func Run() {
 		dbg.Printf("Error: %v", err)
 		fatalApp(err, nil)
 	}
-	defer win.CloseSerial(handle)
+	defer func() {
+		win.CloseSerial(handle)
+	}()
 	dbg.Printf("Serial port opened.")
-
-	dbg.Printf("Sending HELLO handshake...")
-	resp, err := win.SendHello(handle)
-	if err != nil {
-		dbg.Printf("Error: %v", err)
-		fatalApp(err, nil)
-	}
-	dbg.Printf("Response (%d bytes): %s", len(resp), win.InterpretHello(resp))
 
 	configPath := appConfigPath()
 	chartCfg, err := chart.LoadConfig(configPath)
@@ -160,12 +154,64 @@ func Run() {
 		bgColor = chartCfg.Colors.Background.RGBA
 	}
 	base := renderBaseFrame(labels, fontColor, bgColor)
-	if err := win.SendDisplayBitmapRevA(handle, 0, 0, screenWidth-1, screenHeight-1, base); err != nil {
-		dbg.Printf("Error: %v", err)
-		fatalApp(err, nil)
-	}
-	dbg.Printf("Base frame sent.")
 	screenFrame := frame.NewScreenFrame(base)
+
+	sendFullFrame := func() error {
+		return win.SendDisplayBitmapRevA(handle, 0, 0, screenWidth-1, screenHeight-1, screenFrame)
+	}
+
+	syncDisplay := func() error {
+		dbg.Printf("Sending HELLO handshake...")
+		resp, err := win.SendHello(handle)
+		if err != nil {
+			return fmt.Errorf("send HELLO: %w", err)
+		}
+		dbg.Printf("Response (%d bytes): %s", len(resp), win.InterpretHello(resp))
+		if err := sendFullFrame(); err != nil {
+			return fmt.Errorf("send base frame: %w", err)
+		}
+		dbg.Printf("Base frame sent.")
+		return nil
+	}
+
+	reconnectDisplay := func() error {
+		const reconnectAttempts = 3
+		const reconnectDelay = 5 * time.Second
+
+		oldHandle := handle
+		handle = 0
+		win.CloseSerial(oldHandle)
+
+		var lastErr error
+		for attempt := 1; attempt <= reconnectAttempts; attempt++ {
+			time.Sleep(reconnectDelay)
+
+			dbg.Printf("Reopening serial port after display write failure (attempt %d/%d)...", attempt, reconnectAttempts)
+			newHandle, openErr := win.OpenSerial(comPort)
+			if openErr != nil {
+				lastErr = openErr
+				dbg.Printf("Error: %v", openErr)
+				continue
+			}
+
+			handle = newHandle
+			if syncErr := syncDisplay(); syncErr != nil {
+				lastErr = syncErr
+				dbg.Printf("Error: %v", syncErr)
+				win.CloseSerial(newHandle)
+				handle = 0
+				continue
+			}
+
+			dbg.Printf("Display reconnected and resynced.")
+			return nil
+		}
+
+		if lastErr == nil {
+			lastErr = fmt.Errorf("display reconnect failed without a specific error")
+		}
+		return fmt.Errorf("reconnect display after write failure: %w", lastErr)
+	}
 
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
@@ -253,11 +299,33 @@ func Run() {
 	}
 
 	turn := 0
-	if err := updateStats(turn); err != nil {
-		if recovered, _ := recoverStats(err); recovered {
-			err = updateStats(turn)
+	if err := syncDisplay(); err != nil {
+		dbg.Printf("Error: %v", err)
+		if isRecoverableDisplayWriteError(err) {
+			dbg.Printf("Display write failed with recoverable error: %v", err)
+			if reconnectErr := reconnectDisplay(); reconnectErr != nil {
+				dbg.Printf("Error: %v", reconnectErr)
+				fatalApp(reconnectErr, nil)
+			}
+		} else {
+			fatalApp(err, nil)
 		}
-		if err != nil {
+	}
+
+	if err := updateStats(turn); err != nil {
+		if isRecoverableDisplayWriteError(err) {
+			dbg.Printf("Display write failed with recoverable error: %v", err)
+			if reconnectErr := reconnectDisplay(); reconnectErr != nil {
+				dbg.Printf("Error: %v", reconnectErr)
+				fatalApp(reconnectErr, nil)
+			}
+		} else if recovered, _ := recoverStats(err); recovered {
+			err = updateStats(turn)
+			if err != nil {
+				dbg.Printf("Error: %v", err)
+				fatalApp(err, nil)
+			}
+		} else {
 			dbg.Printf("Error: %v", err)
 			fatalApp(err, nil)
 		}
@@ -273,6 +341,14 @@ func Run() {
 		time.Sleep(1 * time.Second)
 		turn++
 		if err := updateStats(turn); err != nil {
+			if isRecoverableDisplayWriteError(err) {
+				dbg.Printf("Display write failed with recoverable error: %v", err)
+				if reconnectErr := reconnectDisplay(); reconnectErr != nil {
+					dbg.Printf("Error: %v", reconnectErr)
+					fatalApp(reconnectErr, nil)
+				}
+				continue
+			}
 			if win.IsRetryablePdhError(err) {
 				if recovered, _ := recoverStats(err); recovered {
 					if err = updateStats(turn); err == nil {

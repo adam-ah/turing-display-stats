@@ -231,7 +231,9 @@ func OpenSerial(portName string) (windows.Handle, error) {
 }
 
 func CloseSerial(handle windows.Handle) {
-	windows.CloseHandle(handle)
+	if handle != 0 {
+		windows.CloseHandle(handle)
+	}
 }
 
 // ---------------------------------------------------------------------------

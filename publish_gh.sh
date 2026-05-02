@@ -10,14 +10,57 @@ TAG="${1:-}"
 die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
+latest_git_tag() {
+    git -C "$MODULE_DIR" tag --list 'v*' --sort=-v:refname | head -n 1
+}
+
+bump_tag() {
+    local tag="${1#v}"
+    local -a parts
+    local i last_index
+
+    IFS='.' read -r -a parts <<< "$tag"
+    (( ${#parts[@]} > 0 )) || return 1
+
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9]+$ ]] || return 1
+    done
+
+    last_index=$((${#parts[@]} - 1))
+    parts[$last_index]=$((10#${parts[$last_index]} + 1))
+
+    (IFS=.; printf 'v%s' "${parts[*]}")
+}
+
+resolve_next_tag() {
+    local latest
+    latest="$(latest_git_tag)"
+    if [[ -z "$latest" ]]; then
+        printf '%s' 'v0.1'
+        return 0
+    fi
+
+    bump_tag "$latest"
+}
+
 # --- Pre-flight checks ---
-[[ -n "$TAG" ]] || die "Usage: $0 <tag>  (e.g. v0.1.0)"
+if [[ -z "$TAG" ]]; then
+    info "Resolving next tag..."
+    TAG="$(resolve_next_tag)" || die "Unable to compute next tag from git tags"
+fi
+[[ -n "$TAG" ]] || die "Usage: $0 [tag]  (auto-generates the next tag when omitted)"
+[[ -t 0 ]] || die "Refusing to publish non-interactively."
 command -v gh    >/dev/null 2>&1 || die "'gh' CLI not found — install it first"
 command -v go    >/dev/null 2>&1 || die "'go' not found"
 command -v zip   >/dev/null 2>&1 || die "'zip' not found — install it first"
 
 # Make sure working tree is clean
 [[ -z "$(git -C "$MODULE_DIR" status --porcelain)" ]] || die "Working tree is not clean. Commit or stash changes first."
+
+# --- Confirm release version ---
+info "About to publish version $TAG"
+read -rp "Publish $TAG to GitHub? [y/N] " answer
+[[ "$answer" =~ ^[Yy]$ ]] || { info "Aborted — release cancelled."; exit 0; }
 
 # --- Build ---
 info "Formatting Go files..."
@@ -47,10 +90,6 @@ cd "$DIST_DIR" && zip -r "$MODULE_DIR/dist/turing-display.zip" .
 
 info "Build complete: $DIST_DIR"
 ls -lh "$DIST_DIR"
-
-# --- Confirm before publishing ---
-read -rp "Tested the exe? Push to GitHub? [y/N] " answer
-[[ "$answer" =~ ^[Yy]$ ]] || { info "Aborted — test the build first."; exit 0; }
 
 # --- Tag & Push ---
 info "Creating tag $TAG..."
