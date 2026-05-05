@@ -29,7 +29,7 @@ Go app for Windows that drives a **Turing Smart Screen 3.5"** or compatible USB 
 ## Build
 
 ```powershell
-go build -o dist/turing-display.exe ./cmd
+go build -trimpath -ldflags="-H windowsgui -s -w -buildid=" -o dist/turing-display.exe ./cmd
 Copy-Item config\config.json dist\config.json
 ```
 

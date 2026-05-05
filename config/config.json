@@ -18,9 +18,40 @@
     "font_color":  "#000000"
   },
   "graphs": {
-    "cpu":  { "x": 10, "y": 16,  "width": 300, "height": 96, "refresh_sec": 1 },
-    "ram":  { "x": 10, "y": 136, "width": 300, "height": 96, "refresh_sec": 2 },
-    "gpu":  { "x": 10, "y": 256, "width": 300, "height": 96, "refresh_sec": 1 },
-    "vram": { "x": 10, "y": 376, "width": 300, "height": 96, "refresh_sec": 2 }
-  }
+    "cpu": {
+      "x": 10, "y": 16, "width": 300, "height": 96, "refresh_sec": 1
+    },
+    "ram": {
+      "x": 10, "y": 256, "width": 140, "height": 96, "refresh_sec": 2
+    },
+    "gpu": {
+      "x": 10, "y": 136, "width": 300, "height": 96, "refresh_sec": 1
+    },
+    "vram": {
+      "x": 170, "y": 256, "width": 140, "height": 96, "refresh_sec": 2
+    },
+    "network": {
+      "x": 10, "y": 376, "width": 140, "height": 96, "refresh_sec": 2,
+      "max_bytes_per_sec": 125000000,
+      "series": [
+        { "name": "download", "color": "#117311", "fill_color": "#90EE90" },
+        { "name": "upload", "color": "#0057D9", "fill_color": "#BFD7FF" }
+      ]
+    },
+    "disk": {
+      "x": 170, "y": 376, "width": 140, "height": 96, "refresh_sec": 2,
+      "series": [
+        { "name": "read", "color": "#ab0202", "fill_color": "#FFB6C1" },
+        { "name": "write", "color": "#FF8C00", "fill_color": "#FFD7A8" }
+      ]
+    }
+  },
+  "blocks": [
+    { "metric": "cpu", "label": "CPU", "x": 0, "y": 0, "width": 320, "height": 120 },
+    { "metric": "gpu", "label": "GPU", "x": 0, "y": 120, "width": 320, "height": 120 },
+    { "metric": "ram", "label": "RAM", "x": 0, "y": 240, "width": 160, "height": 120 },
+    { "metric": "vram", "label": "VRAM", "x": 160, "y": 240, "width": 160, "height": 120 },
+    { "metric": "network", "label": "NET", "x": 0, "y": 360, "width": 160, "height": 120 },
+    { "metric": "disk", "label": "DISK", "x": 160, "y": 360, "width": 160, "height": 120 }
+  ]
 }

@@ -693,6 +693,82 @@ func TestChartUpdateRepeated(t *testing.T) {
 	}
 }
 
+func TestSeriesChartUpdateRepeated(t *testing.T) {
+	cfg := GraphConfig{
+		X:      0,
+		Y:      0,
+		Width:  8,
+		Height: 20,
+		Series: []SeriesConfig{
+			{Name: "down", Color: RGBA{color.RGBA{0, 255, 0, 255}}, FillColor: RGBA{color.RGBA{200, 255, 200, 255}}},
+			{Name: "up", Color: RGBA{color.RGBA{255, 0, 0, 255}}, FillColor: RGBA{color.RGBA{255, 200, 200, 255}}},
+		},
+	}
+	c := newSeriesChart(cfg, 4, color.RGBA{255, 255, 255, 255}, true)
+
+	regions := c.UpdateRepeated([]float64{20, 80}, 1)
+	if len(regions) != 1 {
+		t.Fatalf("got %d regions, want 1", len(regions))
+	}
+	img := regions[0].Image
+	if clr, ok := img.At(4, c.valueToY(20)).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Fatalf("download pixel = %#v, want green", img.At(4, c.valueToY(20)))
+	}
+	if clr, ok := img.At(4, c.valueToY(80)).(color.RGBA); !ok || colorName(clr) != "red" {
+		t.Fatalf("upload pixel = %#v, want red", img.At(4, c.valueToY(80)))
+	}
+}
+
+func TestSeriesChartUpdateSamplesKeepsFineGrainedValues(t *testing.T) {
+	cfg := GraphConfig{
+		X:      0,
+		Y:      0,
+		Width:  8,
+		Height: 20,
+		Series: []SeriesConfig{
+			{Name: "value", Color: RGBA{color.RGBA{0, 255, 0, 255}}, FillColor: RGBA{color.RGBA{200, 255, 200, 255}}},
+		},
+	}
+	c := newSeriesChart(cfg, 4, color.RGBA{255, 255, 255, 255}, true)
+
+	regions := c.UpdateSamples([][]float64{{20}, {80}})
+	if len(regions) != 1 {
+		t.Fatalf("got %d regions, want 1", len(regions))
+	}
+	img := regions[0].Image
+	if clr, ok := img.At(0, c.valueToY(20)).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Fatalf("first sample pixel = %#v, want green", img.At(0, c.valueToY(20)))
+	}
+	if clr, ok := img.At(4, c.valueToY(80)).(color.RGBA); !ok || colorName(clr) != "green" {
+		t.Fatalf("second sample pixel = %#v, want green", img.At(4, c.valueToY(80)))
+	}
+}
+
+func TestSeriesChartWithoutLinesFillsLastContentRow(t *testing.T) {
+	fill := color.RGBA{200, 255, 200, 255}
+	cfg := GraphConfig{
+		X:      0,
+		Y:      0,
+		Width:  8,
+		Height: 20,
+		Series: []SeriesConfig{
+			{Name: "value", Color: RGBA{color.RGBA{0, 255, 0, 255}}, FillColor: RGBA{fill}},
+		},
+	}
+	c := newSeriesChart(cfg, 4, color.RGBA{255, 255, 255, 255}, false)
+
+	_ = c.UpdateRepeated([]float64{50}, 1)
+	regions := c.UpdateRepeated([]float64{50}, 1)
+	if len(regions) != 1 {
+		t.Fatalf("got %d regions, want 1", len(regions))
+	}
+	img := regions[0].Image
+	lastRow := img.Bounds().Dy() - 1
+	if got := img.At(4, lastRow); got != fill {
+		t.Fatalf("last content row = %#v, want fill %#v", got, fill)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // update — fill phase (with lines)
 // ---------------------------------------------------------------------------
@@ -1091,5 +1167,72 @@ func TestLoadConfigWithColors(t *testing.T) {
 	}
 	if cfg.Colors.FontColor.RGBA != (color.RGBA{0, 0, 0, 255}) {
 		t.Errorf("font_color = %v, want {0, 0, 0, 255}", cfg.Colors.FontColor.RGBA)
+	}
+}
+
+func TestLoadConfigWithBlocksAndSeries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	_ = os.WriteFile(path, []byte(`{
+		"screen": {"width": 320, "height": 480},
+		"dot_size": 4,
+		"thresholds": {"green": 0, "yellow": 50, "red": 80},
+		"colors": {
+			"green":       "#117311",
+			"yellow":      "#ffdd00",
+			"red":         "#ab0202",
+			"green_fill":  "#90EE90",
+			"yellow_fill": "#faf0cd",
+			"red_fill":    "#FFB6C1",
+			"background":  "#FFFFFF",
+			"font_color":  "#000000"
+		},
+		"graphs": {
+			"network": {
+				"x": 10, "y": 376, "width": 140, "height": 96, "refresh_sec": 2,
+				"max_bytes_per_sec": 125000000,
+				"series": [
+					{"name": "download", "color": "#117311", "fill_color": "#90EE90"},
+					{"name": "upload", "color": "#0057D9", "fill_color": "#BFD7FF"}
+				]
+			},
+			"disk": {
+				"x": 170, "y": 376, "width": 140, "height": 96, "refresh_sec": 2,
+				"series": [
+					{"name": "read", "color": "#ab0202", "fill_color": "#FFB6C1"},
+					{"name": "write", "color": "#6A3D9A", "fill_color": "#D7C7F2"}
+				]
+			}
+		},
+		"blocks": [
+			{"metric": "network", "label": "NET", "x": 0, "y": 360, "width": 160, "height": 120},
+			{"metric": "disk", "label": "DISK", "x": 160, "y": 360, "width": 160, "height": 120}
+		]
+	}`), 0644)
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := cfg.Graphs["network"].MaxBytesPerSec; got != 125000000 {
+		t.Fatalf("network max_bytes_per_sec = %v, want 125000000", got)
+	}
+	if got := cfg.Graphs["network"].RefreshSec; got != 2 {
+		t.Fatalf("network refresh_sec = %d, want 2", got)
+	}
+	if got := cfg.Graphs["disk"].RefreshSec; got != 2 {
+		t.Fatalf("disk refresh_sec = %d, want 2", got)
+	}
+	if got := len(cfg.Graphs["network"].Series); got != 2 {
+		t.Fatalf("network series count = %d, want 2", got)
+	}
+	if got := cfg.Graphs["network"].Series[1].Name; got != "upload" {
+		t.Fatalf("network series[1].name = %q, want upload", got)
+	}
+	if got := len(cfg.Blocks); got != 2 {
+		t.Fatalf("blocks count = %d, want 2", got)
+	}
+	if cfg.Blocks[0].Metric != "network" || cfg.Blocks[1].Metric != "disk" {
+		t.Fatalf("blocks = %+v, want network/disk", cfg.Blocks)
 	}
 }

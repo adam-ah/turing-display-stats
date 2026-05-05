@@ -79,8 +79,8 @@ info "Building Windows resources..."
 info "Building turing-display.exe..."
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
-(cd "$MODULE_DIR" && GOOS=windows GOARCH=amd64 go build \
-    -ldflags="-H windowsgui" -o dist/turing-display.exe ./cmd)
+(cd "$MODULE_DIR" && GOOS=windows GOARCH=amd64 go build -trimpath \
+    -ldflags="-H windowsgui -s -w -buildid=" -o dist/turing-display.exe ./cmd)
 
 info "Copying config..."
 cp "$MODULE_DIR/config/config.json" "$DIST_DIR/config.json"

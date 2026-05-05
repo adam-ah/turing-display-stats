@@ -40,6 +40,7 @@ type ChartConfig struct {
 	Thresholds ThresholdConfig        `json:"thresholds"`
 	Colors     ColorConfig            `json:"colors"`
 	Graphs     map[string]GraphConfig `json:"graphs"`
+	Blocks     []BlockConfig          `json:"blocks"`
 }
 
 type ScreenConfig struct {
@@ -47,22 +48,41 @@ type ScreenConfig struct {
 	Height int `json:"height"`
 }
 
+type BlockConfig struct {
+	Metric string `json:"metric"`
+	Label  string `json:"label"`
+	X      int    `json:"x"`
+	Y      int    `json:"y"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+}
+
+type SeriesConfig struct {
+	Name      string `json:"name"`
+	Color     RGBA   `json:"color"`
+	FillColor RGBA   `json:"fill_color"`
+}
+
 type GraphConfig struct {
-	X          int `json:"x"`
-	Y          int `json:"y"`
-	Width      int `json:"width"`
-	Height     int `json:"height"`
-	RefreshSec int `json:"refresh_sec"` // whole seconds between fresh samples; 0 = use default 1s
+	X              int            `json:"x"`
+	Y              int            `json:"y"`
+	Width          int            `json:"width"`
+	Height         int            `json:"height"`
+	RefreshSec     int            `json:"refresh_sec"` // whole seconds between fresh samples; 0 = use default 1s
+	MaxBytesPerSec float64        `json:"max_bytes_per_sec"`
+	Series         []SeriesConfig `json:"series"`
 }
 
 func (g *GraphConfig) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		X          int  `json:"x"`
-		Y          int  `json:"y"`
-		Width      int  `json:"width"`
-		Height     int  `json:"height"`
-		RefreshSec *int `json:"refresh_sec"`
-		RefreshMs  *int `json:"refresh_ms"`
+		X              int            `json:"x"`
+		Y              int            `json:"y"`
+		Width          int            `json:"width"`
+		Height         int            `json:"height"`
+		RefreshSec     *int           `json:"refresh_sec"`
+		RefreshMs      *int           `json:"refresh_ms"`
+		MaxBytesPerSec float64        `json:"max_bytes_per_sec"`
+		Series         []SeriesConfig `json:"series"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -81,6 +101,8 @@ func (g *GraphConfig) UnmarshalJSON(data []byte) error {
 	default:
 		g.RefreshSec = 0
 	}
+	g.MaxBytesPerSec = raw.MaxBytesPerSec
+	g.Series = raw.Series
 
 	return nil
 }
@@ -127,6 +149,7 @@ type Chart struct {
 	filled     bool
 	prevColors []color.RGBA
 	prevValues []float64
+	scratch    *image.RGBA
 	linesDrawn bool
 	noLines    bool // when true, never draw bounding lines; use full height for dots
 }
@@ -417,7 +440,7 @@ func (c *Chart) renderFullBlock(colors []color.RGBA, values []float64, drawLines
 		blockHeight = blockBot - blockTop + 1
 	}
 
-	img := image.NewRGBA(image.Rect(0, 0, c.cfg.Width, blockHeight))
+	img := c.scratchImage(c.cfg.Width, blockHeight)
 
 	// Fill background.
 	for y := 0; y < blockHeight; y++ {
@@ -477,6 +500,13 @@ func (c *Chart) renderFullBlock(colors []color.RGBA, values []float64, drawLines
 		Y:     c.cfg.Y + blockTop,
 		Image: img,
 	}
+}
+
+func (c *Chart) scratchImage(width, height int) *image.RGBA {
+	if c.scratch == nil || c.scratch.Bounds().Dx() != width || c.scratch.Bounds().Dy() != height {
+		c.scratch = image.NewRGBA(image.Rect(0, 0, width, height))
+	}
+	return c.scratch
 }
 
 // drawBoundingLines — top (100%) and bottom (0%) lines, 1px high each.

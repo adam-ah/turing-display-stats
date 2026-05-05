@@ -1,10 +1,11 @@
 //go:build windows
 
 // turing-display-go: Communicate with Turing Smart Screen displays from Go.
-// Build: go build -ldflags="-H windowsgui" -o turing-display.exe
+// Build: go build -trimpath -ldflags="-H windowsgui -s -w -buildid=" -o turing-display.exe
 package app
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"image/color"
@@ -35,6 +36,35 @@ func (l *debugLogger) Printf(format string, v ...interface{}) {
 }
 
 var dbg debugLogger
+
+type runtimeMetric struct {
+	name   string
+	graph  chart.GraphConfig
+	cache  sampler.MetricCache
+	sCache sampler.SeriesMetricCache
+	single *chart.Chart
+	series *chart.SeriesChart
+}
+
+type pdhMetricSource string
+
+const (
+	pdhMetricGPU pdhMetricSource = "gpu"
+	pdhMetricIO  pdhMetricSource = "io"
+)
+
+type pdhMetricError struct {
+	source pdhMetricSource
+	err    error
+}
+
+func (e pdhMetricError) Error() string {
+	return e.err.Error()
+}
+
+func (e pdhMetricError) Unwrap() error {
+	return e.err
+}
 
 func fatalApp(err error, recovered any) {
 	win.ShowErrorDialog(fatalFailureTitle, formatFatalFailure(err, recovered))
@@ -107,57 +137,75 @@ func Run() {
 	}
 	defer statsQuery.Close()
 
+	var hasNetworkGraph, hasDiskGraph bool
+	var ioQuery *win.NetworkDiskPdhQuery
+	if chartCfg != nil {
+		_, hasNetworkGraph = chartCfg.Graphs["network"]
+		_, hasDiskGraph = chartCfg.Graphs["disk"]
+		if hasNetworkGraph || hasDiskGraph {
+			ioQuery, err = win.NewNetworkDiskPdhQuery(hasNetworkGraph, hasDiskGraph)
+			if err != nil {
+				dbg.Printf("Error: %v", err)
+				fatalApp(err, nil)
+			}
+			defer ioQuery.Close()
+		}
+	}
+
 	cpuSampler, err := win.NewCpuUsageSampler()
 	if err != nil {
 		dbg.Printf("Error: %v", err)
 		fatalApp(err, nil)
 	}
 
-	stats, err := statsQuery.Snapshot()
-	if err != nil {
-		dbg.Printf("Error: %v", err)
-		fatalApp(err, nil)
-	}
-	memory, err := win.ReadSystemMemoryStats()
-	if err != nil {
-		dbg.Printf("Error: %v", err)
-		fatalApp(err, nil)
-	}
-
-	var charts [4]*chart.Chart
-	var metricCaches [4]sampler.MetricCache
-	for i := range metricCaches {
-		metricCaches[i] = sampler.NewMetricCache(1)
-	}
-	if chartCfg != nil {
-		names := [4]string{"cpu", "ram", "gpu", "vram"}
-		for i, name := range names {
-			if gCfg, ok := chartCfg.Graphs[name]; ok {
-				charts[i] = chart.NewChart(gCfg, chartCfg.DotSize, chartCfg.Thresholds, chartCfg.Colors, chartCfg.Colors.Background.RGBA, gCfg.RefreshSec, true)
-				metricCaches[i] = sampler.NewMetricCache(gCfg.RefreshSec)
-				dbg.Printf("%s chart: %dx%d at (%d,%d), capacity=%d",
-					name, gCfg.Width, gCfg.Height, gCfg.X, gCfg.Y, charts[i].Capacity())
-			}
-		}
-	}
-
-	labels := [4]string{
-		"CPU",
-		fmt.Sprintf("RAM - %s", win.FormatBytesGiB(memory.TotalBytes)),
-		"GPU",
-		fmt.Sprintf("VRAM - %s", win.FormatBytesGiB(stats.TotalBytes)),
-	}
+	screenCfg := defaultScreen()
+	blocks := defaultBlocks()
 	fontColor := color.RGBA{0, 0, 0, 255}
 	bgColor := color.RGBA{255, 255, 255, 255}
 	if chartCfg != nil {
+		screenCfg = chartCfg.Screen
 		fontColor = chartCfg.Colors.FontColor.RGBA
 		bgColor = chartCfg.Colors.Background.RGBA
+		if len(chartCfg.Blocks) > 0 {
+			blocks = chartCfg.Blocks
+		}
 	}
-	base := renderBaseFrame(labels, fontColor, bgColor)
+	if screenCfg.Width <= 0 || screenCfg.Height <= 0 {
+		screenCfg = defaultScreen()
+	}
+	base := renderBaseFrame(screenCfg, blocks, fontColor, bgColor)
 	screenFrame := frame.NewScreenFrame(base)
 
 	sendFullFrame := func() error {
-		return win.SendDisplayBitmapRevA(handle, 0, 0, screenWidth-1, screenHeight-1, screenFrame)
+		return win.SendDisplayBitmapRevA(handle, 0, 0, screenCfg.Width-1, screenCfg.Height-1, screenFrame)
+	}
+
+	metrics := make([]runtimeMetric, 0, len(blocks))
+	for _, block := range blocks {
+		if chartCfg == nil {
+			continue
+		}
+		gCfg, ok := chartCfg.Graphs[block.Metric]
+		if !ok {
+			continue
+		}
+		rt := runtimeMetric{
+			name:  block.Metric,
+			graph: gCfg,
+			cache: sampler.NewMetricCache(gCfg.RefreshSec),
+		}
+		switch block.Metric {
+		case "network", "disk":
+			rt.series = chart.NewSeriesChart(gCfg, chartCfg.DotSize, chartCfg.Colors.Background.RGBA, true)
+			rt.sCache = sampler.NewSeriesMetricCache(gCfg.RefreshSec)
+			dbg.Printf("%s chart: %dx%d at (%d,%d), capacity=%d",
+				block.Metric, gCfg.Width, gCfg.Height, gCfg.X, gCfg.Y, rt.series.Capacity())
+		default:
+			rt.single = chart.NewChart(gCfg, chartCfg.DotSize, chartCfg.Thresholds, chartCfg.Colors, chartCfg.Colors.Background.RGBA, gCfg.RefreshSec, true)
+			dbg.Printf("%s chart: %dx%d at (%d,%d), capacity=%d",
+				block.Metric, gCfg.Width, gCfg.Height, gCfg.X, gCfg.Y, rt.single.Capacity())
+		}
+		metrics = append(metrics, rt)
 	}
 
 	syncDisplay := func() error {
@@ -217,10 +265,53 @@ func Run() {
 	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
 
+	recoverGpuStats := func(err error) (bool, error) {
+		var metricErr pdhMetricError
+		if !errors.As(err, &metricErr) || metricErr.source != pdhMetricGPU || !win.IsRetryablePdhError(err) {
+			return false, err
+		}
+		dbg.Printf("GPU stats query failed with retryable PDH error: %v", err)
+		rebuilt, rebuildErr := win.NewGpuPdhQuery()
+		if rebuildErr != nil {
+			dbg.Printf("GPU stats query rebuild failed: %v", rebuildErr)
+			return false, rebuildErr
+		}
+		oldQuery := statsQuery
+		statsQuery = rebuilt
+		oldQuery.Close()
+		dbg.Printf("GPU stats query rebuilt after PDH error.")
+		return true, nil
+	}
+
+	recoverIOStats := func(err error) (bool, error) {
+		var metricErr pdhMetricError
+		if ioQuery == nil || !errors.As(err, &metricErr) || metricErr.source != pdhMetricIO || !win.IsRetryablePdhError(err) {
+			return false, err
+		}
+		dbg.Printf("Network/disk stats query failed with retryable PDH error: %v", err)
+		rebuilt, rebuildErr := win.NewNetworkDiskPdhQuery(hasNetworkGraph, hasDiskGraph)
+		if rebuildErr != nil {
+			dbg.Printf("Network/disk stats query rebuild failed: %v", rebuildErr)
+			return false, rebuildErr
+		}
+		oldQuery := ioQuery
+		ioQuery = rebuilt
+		oldQuery.Close()
+		dbg.Printf("Network/disk stats query rebuilt after PDH error.")
+		return true, nil
+	}
+
 	updateStats := func(turn int) error {
 		stats, err := statsQuery.Snapshot()
 		if err != nil {
-			return err
+			return pdhMetricError{source: pdhMetricGPU, err: err}
+		}
+		var ioStats win.NetworkDiskStats
+		if ioQuery != nil {
+			ioStats, err = ioQuery.Snapshot()
+			if err != nil {
+				return pdhMetricError{source: pdhMetricIO, err: err}
+			}
 		}
 		memory, err := win.ReadSystemMemoryStats()
 		if err != nil {
@@ -238,64 +329,99 @@ func Run() {
 			vramPct = float64(stats.UsedBytes) * 100 / float64(stats.TotalBytes)
 		}
 
-		cpuPct, cpuRepeats := metricCaches[0].Update(turn, cpuPct)
-		ramPct, ramRepeats := metricCaches[1].Update(turn, ramPct)
-		gpuPct, gpuRepeats := metricCaches[2].Update(turn, gpuPct)
-		vramPct, vramRepeats := metricCaches[3].Update(turn, vramPct)
+		var ioDownPct, ioUpPct, ioDiskReadPct, ioDiskWritePct float64
 
-		for i, ch := range charts {
-			if ch == nil {
-				continue
-			}
-			var value float64
-			var repeats int
-			switch i {
-			case 0:
-				value = cpuPct
-				repeats = cpuRepeats
-			case 1:
-				value = ramPct
-				repeats = ramRepeats
-			case 2:
-				value = gpuPct
-				repeats = gpuRepeats
-			case 3:
-				value = vramPct
-				repeats = vramRepeats
-			}
-			if repeats == 0 {
-				continue
-			}
-			dirtyRegions := ch.UpdateRepeated(value, repeats)
-			chart.ApplyRegions(screenFrame, dirtyRegions)
-			for _, r := range dirtyRegions {
-				if err := win.SendDisplayBitmapRevA(handle, r.X, r.Y,
-					r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
-					return err
+		for i := range metrics {
+			m := &metrics[i]
+			switch m.name {
+			case "cpu":
+				value, repeats := m.cache.Update(turn, cpuPct)
+				if repeats == 0 || m.single == nil {
+					continue
+				}
+				dirtyRegions := m.single.UpdateRepeated(value, repeats)
+				chart.ApplyRegions(screenFrame, dirtyRegions)
+				for _, r := range dirtyRegions {
+					if err := win.SendDisplayBitmapRevA(handle, r.X, r.Y,
+						r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
+						return err
+					}
+				}
+			case "ram":
+				value, repeats := m.cache.Update(turn, ramPct)
+				if repeats == 0 || m.single == nil {
+					continue
+				}
+				dirtyRegions := m.single.UpdateRepeated(value, repeats)
+				chart.ApplyRegions(screenFrame, dirtyRegions)
+				for _, r := range dirtyRegions {
+					if err := win.SendDisplayBitmapRevA(handle, r.X, r.Y,
+						r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
+						return err
+					}
+				}
+			case "gpu":
+				value, repeats := m.cache.Update(turn, gpuPct)
+				if repeats == 0 || m.single == nil {
+					continue
+				}
+				dirtyRegions := m.single.UpdateRepeated(value, repeats)
+				chart.ApplyRegions(screenFrame, dirtyRegions)
+				for _, r := range dirtyRegions {
+					if err := win.SendDisplayBitmapRevA(handle, r.X, r.Y,
+						r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
+						return err
+					}
+				}
+			case "vram":
+				value, repeats := m.cache.Update(turn, vramPct)
+				if repeats == 0 || m.single == nil {
+					continue
+				}
+				dirtyRegions := m.single.UpdateRepeated(value, repeats)
+				chart.ApplyRegions(screenFrame, dirtyRegions)
+				for _, r := range dirtyRegions {
+					if err := win.SendDisplayBitmapRevA(handle, r.X, r.Y,
+						r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
+						return err
+					}
+				}
+			case "network":
+				ioDownPct = sampler.NormalizeBytesPerSec(ioStats.NetworkDownloadBytesPerSec, m.graph.MaxBytesPerSec)
+				ioUpPct = sampler.NormalizeBytesPerSec(ioStats.NetworkUploadBytesPerSec, m.graph.MaxBytesPerSec)
+				samples := m.sCache.Update(turn, []float64{ioDownPct, ioUpPct})
+				if len(samples) == 0 || m.series == nil {
+					continue
+				}
+				dirtyRegions := m.series.UpdateSamples(samples)
+				chart.ApplyRegions(screenFrame, dirtyRegions)
+				for _, r := range dirtyRegions {
+					if err := win.SendDisplayBitmapRevA(handle, r.X, r.Y,
+						r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
+						return err
+					}
+				}
+			case "disk":
+				ioDiskReadPct = sampler.NormalizeDiskActiveTimePct(ioStats.DiskReadActivePct)
+				ioDiskWritePct = sampler.NormalizeDiskActiveTimePct(ioStats.DiskWriteActivePct)
+				samples := m.sCache.Update(turn, []float64{ioDiskReadPct, ioDiskWritePct})
+				if len(samples) == 0 || m.series == nil {
+					continue
+				}
+				dirtyRegions := m.series.UpdateSamples(samples)
+				chart.ApplyRegions(screenFrame, dirtyRegions)
+				for _, r := range dirtyRegions {
+					if err := win.SendDisplayBitmapRevA(handle, r.X, r.Y,
+						r.X+r.Image.Bounds().Dx()-1, r.Y+r.Image.Bounds().Dy()-1, r.Image); err != nil {
+						return err
+					}
 				}
 			}
 		}
 
-		dbg.Printf("Refreshed: CPU=%.0f%% RAM=%.0f%% GPU=%.0f%% VRAM=%.0f%%",
-			cpuPct, ramPct, gpuPct, vramPct)
+		dbg.Printf("Refreshed: CPU=%.0f%% RAM=%.0f%% GPU=%.0f%% VRAM=%.0f%% NET=%.0f%%/%.0f%% DISK=%.0f%%/%.0f%%",
+			cpuPct, ramPct, gpuPct, vramPct, ioDownPct, ioUpPct, ioDiskReadPct, ioDiskWritePct)
 		return nil
-	}
-
-	recoverStats := func(err error) (bool, error) {
-		if !win.IsRetryablePdhError(err) {
-			return false, err
-		}
-		dbg.Printf("GPU stats query failed with retryable PDH error: %v", err)
-		rebuilt, rebuildErr := win.NewGpuPdhQuery()
-		if rebuildErr != nil {
-			dbg.Printf("GPU stats query rebuild failed: %v", rebuildErr)
-			return false, rebuildErr
-		}
-		oldQuery := statsQuery
-		statsQuery = rebuilt
-		oldQuery.Close()
-		dbg.Printf("GPU stats query rebuilt after PDH error.")
-		return true, nil
 	}
 
 	turn := 0
@@ -319,7 +445,13 @@ func Run() {
 				dbg.Printf("Error: %v", reconnectErr)
 				fatalApp(reconnectErr, nil)
 			}
-		} else if recovered, _ := recoverStats(err); recovered {
+		} else if recovered, _ := recoverGpuStats(err); recovered {
+			err = updateStats(turn)
+			if err != nil {
+				dbg.Printf("Error: %v", err)
+				fatalApp(err, nil)
+			}
+		} else if recovered, _ := recoverIOStats(err); recovered {
 			err = updateStats(turn)
 			if err != nil {
 				dbg.Printf("Error: %v", err)
@@ -350,11 +482,16 @@ func Run() {
 				continue
 			}
 			if win.IsRetryablePdhError(err) {
-				if recovered, _ := recoverStats(err); recovered {
+				if recovered, _ := recoverGpuStats(err); recovered {
 					if err = updateStats(turn); err == nil {
 						continue
 					}
 					dbg.Printf("GPU stats refresh still failing after rebuild: %v", err)
+				} else if recovered, _ := recoverIOStats(err); recovered {
+					if err = updateStats(turn); err == nil {
+						continue
+					}
+					dbg.Printf("Network/disk stats refresh still failing after rebuild: %v", err)
 				}
 				continue
 			}

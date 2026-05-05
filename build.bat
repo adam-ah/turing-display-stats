@@ -25,7 +25,7 @@ if errorlevel 1 (
     exit /b 1
 )
 echo Building turing-display.exe...
-go build -ldflags="-H windowsgui" -o dist\turing-display.exe ./cmd
+go build -trimpath -ldflags="-H windowsgui -s -w -buildid=" -o dist\turing-display.exe ./cmd
 if errorlevel 1 (
     echo Build failed!
     exit /b 1
